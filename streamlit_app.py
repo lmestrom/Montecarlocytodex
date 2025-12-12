@@ -524,4 +524,4 @@ if run_btn:
 
 else:
     st.info("Set parameters in the sidebar and click **Run simulation**.")
-``` [❶](code://python)
+```
