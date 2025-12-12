@@ -1,14 +1,22 @@
+# streamlit_app.py
+# Seed Train Monte Carlo (Cytodex surface model)
+# Option 1 implemented: Infectable = OCCUPIED + NEWLY_OCCUPIED + INHIBITED
+# (i.e., monolayer-accessible includes growth-inhibited; MULTILAYER is non-infectable)
+
 import io
 import math
 import random
+import zipfile
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-import zipfile
 
 # ----------------------------
-# Core grid model (surface only)
+# Cell states
 # ----------------------------
 UNOCCUPIED = 0
 OCCUPIED = 1
@@ -17,14 +25,16 @@ INHIBITED = 3
 MULTILAYER = 4
 
 
-def update_state(grid, multilayer_cycle_grid):
+# ----------------------------
+# Core grid model (surface-only)
+# ----------------------------
+def update_state(grid: np.ndarray, multilayer_cycle_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """One growth step on a periodic grid."""
     grid_size = grid.shape[0]
     new_grid = np.copy(grid)
 
     for i in range(grid_size):
         for j in range(grid_size):
-
             if grid[i, j] == OCCUPIED:
                 neighbors = [
                     (x % grid_size, y % grid_size)
@@ -40,10 +50,12 @@ def update_state(grid, multilayer_cycle_grid):
                         new_grid[x, y] = NEWLY_OCCUPIED
                         placed = True
                         break
+
                 if not placed:
+                    # Becomes growth-inhibited (still monolayer)
                     new_grid[i, j] = INHIBITED
 
-            # multilayer rule
+            # multilayer rule: inhibited can become multilayer depending on neighborhood
             if new_grid[i, j] == INHIBITED:
                 neighbors = [
                     (x % grid_size, y % grid_size)
@@ -51,7 +63,6 @@ def update_state(grid, multilayer_cycle_grid):
                     for y in range(j - 1, j + 2)
                     if (x, y) != (i, j)
                 ]
-
                 if any(new_grid[x, y] in (INHIBITED, MULTILAYER) for x, y in neighbors):
                     multilayer_cycle_grid[i, j] += 1
                     if multilayer_cycle_grid[i, j] >= 1:
@@ -63,21 +74,20 @@ def update_state(grid, multilayer_cycle_grid):
     return new_grid, multilayer_cycle_grid
 
 
-def count_states(grid):
-    """
-    Counts +:
-      - OCCUPIED_TOTAL: all non-empty (occupied+new+inhibited+multilayer)
-      - INFECTABLE: monolayer-accessible (occupied+new)
-    """
-    uno = np.count_nonzero(grid == UNOCCUPIED)
-    occ = np.count_nonzero(grid == OCCUPIED)
-    new = np.count_nonzero(grid == NEWLY_OCCUPIED)
-    inh = np.count_nonzero(grid == INHIBITED)
-    mul = np.count_nonzero(grid == MULTILAYER)
+def count_states(grid: np.ndarray) -> Dict[str, int]:
+    """Counts and derived totals."""
+    uno = int(np.count_nonzero(grid == UNOCCUPIED))
+    occ = int(np.count_nonzero(grid == OCCUPIED))
+    new = int(np.count_nonzero(grid == NEWLY_OCCUPIED))
+    inh = int(np.count_nonzero(grid == INHIBITED))
+    mul = int(np.count_nonzero(grid == MULTILAYER))
 
-    infectable = occ + new
     occupied_total = occ + new + inh + mul
-    total = uno + occupied_total
+
+    # Option 1 (your choice): infectable includes inhibited (monolayer-accessible)
+    infectable_total = occ + new + inh
+
+    total = uno + occ + new + inh + mul
 
     return {
         "UNOCCUPIED": uno,
@@ -85,8 +95,8 @@ def count_states(grid):
         "NEWLY_OCCUPIED": new,
         "INHIBITED": inh,
         "MULTILAYER": mul,
-        "INFECTABLE": infectable,
         "OCCUPIED_TOTAL": occupied_total,
+        "INFECTABLE_TOTAL": infectable_total,
         "TOTAL": total,
     }
 
@@ -99,349 +109,436 @@ def simulate_surface_mc(
     inoc_cells_per_mc_mean: float,
     inoc_cells_per_mc_sd: float,
     rng_seed: int = 1,
-):
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Monte Carlo simulation of cells/MC over time (surface model).
-    Returns:
-      mean_total, std_total, mean_infectable, std_infectable
+    Returns two DataFrames (mean, std) with columns:
+      OCCUPIED_TOTAL, INFECTABLE_TOTAL, MULTILAYER, INHIBITED, OCCUPIED, NEWLY_OCCUPIED, UNOCCUPIED
     """
     random.seed(rng_seed)
     np.random.seed(rng_seed)
 
-    per_day_total = []
-    per_day_infect = []
+    # store per experiment trajectories for each metric
+    metrics = [
+        "UNOCCUPIED",
+        "OCCUPIED",
+        "NEWLY_OCCUPIED",
+        "INHIBITED",
+        "MULTILAYER",
+        "OCCUPIED_TOTAL",
+        "INFECTABLE_TOTAL",
+    ]
+    trajectories = {m: [] for m in metrics}
 
     for _ in range(n_experiments):
-        max_cells = max(1.0, float(np.random.normal(max_cells_setpoint, max_cells_sd)))
-        grid_size = max(2, int(round(math.sqrt(max_cells))))
-        capacity_sites = grid_size * grid_size
+        max_cells = float(max(1.0, np.random.normal(max_cells_setpoint, max_cells_sd)))
+        grid_size = max(2, int(round(math.sqrt(max_cells))))  # grid holds grid_size^2 sites
 
-        inoc_cells = max(0.0, float(np.random.normal(inoc_cells_per_mc_mean, inoc_cells_per_mc_sd)))
-        inoc_density = min(1.0, inoc_cells / capacity_sites)
+        inoc_cells = float(max(0.0, np.random.normal(inoc_cells_per_mc_mean, inoc_cells_per_mc_sd)))
+
+        # inoc density is fraction of sites initially occupied
+        inoc_density = min(1.0, inoc_cells / float(grid_size * grid_size))
 
         grid = np.zeros((grid_size, grid_size), dtype=int)
         multilayer_cycle_grid = np.zeros((grid_size, grid_size), dtype=int)
 
-        initial_occupied_cells = int(capacity_sites * inoc_density)
+        initial_occupied_cells = int(grid_size * grid_size * inoc_density)
+        if initial_occupied_cells > grid_size * grid_size:
+            initial_occupied_cells = grid_size * grid_size
+
         if initial_occupied_cells > 0:
-            initial_positions = random.sample(range(capacity_sites), initial_occupied_cells)
+            initial_positions = random.sample(range(grid_size * grid_size), initial_occupied_cells)
             for pos in initial_positions:
                 x, y = divmod(pos, grid_size)
                 grid[x, y] = OCCUPIED
 
-        traj_total = []
-        traj_infect = []
-
+        # simulate day-by-day
+        prev_total = None
         for _day in range(days):
             grid, multilayer_cycle_grid = update_state(grid, multilayer_cycle_grid)
             counts = count_states(grid)
 
-            traj_total.append(counts["OCCUPIED_TOTAL"])
-            traj_infect.append(counts["INFECTABLE"])
+            # Sanity check: total occupied (mass-balance) should not decrease
+            if prev_total is not None and counts["OCCUPIED_TOTAL"] < prev_total:
+                raise RuntimeError("BUG: OCCUPIED_TOTAL decreased within a stage.")
+            prev_total = counts["OCCUPIED_TOTAL"]
 
+            for m in metrics:
+                trajectories[m].append(counts[m])
+
+            # finalize NEWLY->OCCUPIED
             grid[grid == NEWLY_OCCUPIED] = OCCUPIED
 
-        per_day_total.append(np.array(traj_total, dtype=float))
-        per_day_infect.append(np.array(traj_infect, dtype=float))
+    # reshape into (n_experiments, days) per metric
+    # trajectories[m] is length n_experiments*days
+    mean_dict = {}
+    std_dict = {}
+    for m in metrics:
+        arr = np.array(trajectories[m], dtype=float).reshape(n_experiments, days)
+        mean_dict[m] = arr.mean(axis=0)
+        std_dict[m] = arr.std(axis=0, ddof=1) if n_experiments > 1 else np.zeros(days, dtype=float)
 
-    arr_total = np.vstack(per_day_total)
-    arr_infect = np.vstack(per_day_infect)
-
-    mean_total = arr_total.mean(axis=0)
-    std_total = arr_total.std(axis=0, ddof=1) if n_experiments > 1 else np.zeros_like(mean_total)
-
-    mean_infect = arr_infect.mean(axis=0)
-    std_infect = arr_infect.std(axis=0, ddof=1) if n_experiments > 1 else np.zeros_like(mean_infect)
-
-    return mean_total, std_total, mean_infect, std_infect
+    mean_df = pd.DataFrame(mean_dict)
+    std_df = pd.DataFrame(std_dict)
+    return mean_df, std_df
 
 
-# ----------------------------
-# Unit conversions
-# ----------------------------
-def cells_per_mc_to_cells_ml(cells_per_mc: np.ndarray, mc_g_per_l: float, particles_per_g: float) -> np.ndarray:
+def mc_to_cells_ml(
+    mean_cells_per_mc: np.ndarray,
+    std_cells_per_mc: np.ndarray,
+    mc_g_per_l: float,
+    particles_per_g: float,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    cells/mL = (cells/MC) * (MC per mL) * (MC per g)
-            = (cells/MC) * (mc_g_per_l/1000) * (particles_per_g)
+    Convert cells/MC -> cells/mL:
+      cells/mL = (mc_g/L * particles/g * cells/particle) / 1000
     """
-    return cells_per_mc * (mc_g_per_l / 1000.0) * particles_per_g
+    cells_ml = (mc_g_per_l * particles_per_g * mean_cells_per_mc) / 1000.0
+    cells_ml_std = (mc_g_per_l * particles_per_g * std_cells_per_mc) / 1000.0
+    return cells_ml, cells_ml_std
 
 
-def surface_traj_to_cells_ml_timeseries(
-    mean_total_cells_per_mc: np.ndarray,
-    std_total_cells_per_mc: np.ndarray,
-    mean_infect_cells_per_mc: np.ndarray,
-    std_infect_cells_per_mc: np.ndarray,
+@dataclass
+class StageResult:
+    name: str
+    t_h: np.ndarray
+    total_cells_ml: np.ndarray
+    total_cells_ml_std: np.ndarray
+    infectable_cells_ml: np.ndarray
+    infectable_cells_ml_std: np.ndarray
+    multilayer_cells_ml: np.ndarray
+    multilayer_cells_ml_std: np.ndarray
+    inoc_cells_ml: float
+    end_total_cells_ml: float
+    end_infectable_cells_ml: float
+    days: int
+    mc_g_per_l: float
+
+
+def run_stage_surface_growth(
+    name: str,
+    n: int,
     days: int,
     mc_g_per_l: float,
     particles_per_g: float,
-    t0_cells_ml: float,
-):
+    max_cells_setpoint: float,
+    max_cells_sd: float,
+    inoc_cells_ml: float,
+    inoc_sd_cells_per_mc: float,
+    rng_seed: int,
+) -> StageResult:
     """
-    Returns:
-      time_h,
-      total_cells_ml, total_cells_ml_std,
-      infectable_cells_ml, infectable_cells_ml_std
+    Runs a stage with surface growth model.
     """
-    t_hours = np.concatenate(([0.0], np.arange(1, days + 1, dtype=float) * 24.0))
+    # cells/mL -> cells/g -> cells/MC
+    cells_per_g = inoc_cells_ml / mc_g_per_l if mc_g_per_l > 0 else 0.0
+    inoc_cells_per_mc_mean = cells_per_g / particles_per_g if particles_per_g > 0 else 0.0
 
-    total_ml = cells_per_mc_to_cells_ml(mean_total_cells_per_mc, mc_g_per_l, particles_per_g)
-    total_ml_std = cells_per_mc_to_cells_ml(std_total_cells_per_mc, mc_g_per_l, particles_per_g)
+    mean_df, std_df = simulate_surface_mc(
+        n_experiments=n,
+        days=days,
+        max_cells_setpoint=max_cells_setpoint,
+        max_cells_sd=max_cells_sd,
+        inoc_cells_per_mc_mean=inoc_cells_per_mc_mean,
+        inoc_cells_per_mc_sd=inoc_sd_cells_per_mc,
+        rng_seed=rng_seed,
+    )
 
-    infect_ml = cells_per_mc_to_cells_ml(mean_infect_cells_per_mc, mc_g_per_l, particles_per_g)
-    infect_ml_std = cells_per_mc_to_cells_ml(std_infect_cells_per_mc, mc_g_per_l, particles_per_g)
+    # time axis: 0, 24, 48, ...
+    t_h = np.concatenate(([0.0], (np.arange(1, days + 1) * 24.0)))
 
-    # include inoculation at t=0
-    total_ml = np.concatenate(([t0_cells_ml], total_ml))
-    total_ml_std = np.concatenate(([0.0], total_ml_std))
+    # convert key metrics to cells/mL
+    total_ml, total_ml_std = mc_to_cells_ml(
+        mean_df["OCCUPIED_TOTAL"].to_numpy(),
+        std_df["OCCUPIED_TOTAL"].to_numpy(),
+        mc_g_per_l,
+        particles_per_g,
+    )
+    infect_ml, infect_ml_std = mc_to_cells_ml(
+        mean_df["INFECTABLE_TOTAL"].to_numpy(),
+        std_df["INFECTABLE_TOTAL"].to_numpy(),
+        mc_g_per_l,
+        particles_per_g,
+    )
+    multi_ml, multi_ml_std = mc_to_cells_ml(
+        mean_df["MULTILAYER"].to_numpy(),
+        std_df["MULTILAYER"].to_numpy(),
+        mc_g_per_l,
+        particles_per_g,
+    )
 
-    infect_ml = np.concatenate(([t0_cells_ml], infect_ml))
-    infect_ml_std = np.concatenate(([0.0], infect_ml_std))
+    # include t0 (flat at inoc)
+    # At t0: total = inoc; infectable = inoc; multilayer = 0
+    total_cells_ml = np.concatenate(([inoc_cells_ml], total_ml))
+    total_cells_ml_std = np.concatenate(([0.0], total_ml_std))
 
-    return t_hours, total_ml, total_ml_std, infect_ml, infect_ml_std
+    infectable_cells_ml = np.concatenate(([inoc_cells_ml], infect_ml))
+    infectable_cells_ml_std = np.concatenate(([0.0], infect_ml_std))
+
+    multilayer_cells_ml = np.concatenate(([0.0], multi_ml))
+    multilayer_cells_ml_std = np.concatenate(([0.0], multi_ml_std))
+
+    return StageResult(
+        name=name,
+        t_h=t_h,
+        total_cells_ml=total_cells_ml,
+        total_cells_ml_std=total_cells_ml_std,
+        infectable_cells_ml=infectable_cells_ml,
+        infectable_cells_ml_std=infectable_cells_ml_std,
+        multilayer_cells_ml=multilayer_cells_ml,
+        multilayer_cells_ml_std=multilayer_cells_ml_std,
+        inoc_cells_ml=float(inoc_cells_ml),
+        end_total_cells_ml=float(total_cells_ml[-1]),
+        end_infectable_cells_ml=float(infect_ml[-1]),
+        days=int(days),
+        mc_g_per_l=float(mc_g_per_l),
+    )
 
 
-# ----------------------------
-# Seed train logic
-# ----------------------------
-def run_seed_train(params):
+def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
     """
-    Runs BIO40 -> BIO200A -> BIO750E/F/G/H -> BIO1500A/B
-
-    Returns:
-      - series dict {stage: df(time_h, cells_ml, cells_ml_std, infectable_cells_ml, infectable_cells_ml_std)}
-      - summary table
+    BIO40 -> BIO200A -> BIO750E/F/G/H
+    Outputs series dict with cumulative time and both TOTAL + INFECTABLE (Option 1).
     """
-    PARTICLES_PER_G = params["particles_per_g"]
-
-    # volumes (mL)
+    # constants
+    particles_per_g = float(params["particles_per_g"])
     V_BIO40 = 40000.0
     V_BIO200A = 200000.0
     V_BIO750 = 750000.0
     V_BIO1500 = 1500000.0
 
     # MC (g/L)
-    MC_BIO40 = params["mc_bio40_g_per_l"]
-    MC_BIO200A = params["mc_bio200a_g_per_l"]
-    MC_BIO750 = params["mc_bio750_g_per_l"]
+    MC_BIO40 = float(params["mc_bio40_g_per_l"])
+    MC_BIO200A = float(params["mc_bio200a_g_per_l"])
+    MC_BIO750 = float(params["mc_bio750_g_per_l"])
 
     # days
-    d40 = params["days_bio40"]
-    d200 = params["days_bio200a"]
-    d750 = params["days_bio750"]
-    d1500 = params["days_bio1500"]
+    d40 = int(params["days_bio40"])
+    d200 = int(params["days_bio200a"])
+    d750 = int(params["days_bio750"])
 
-    n = params["n_experiments"]
+    n = int(params["n_experiments"])
 
-    max_cells_setpoint = params["max_cells_setpoint"]
-    max_cells_sd = params["max_cells_sd"]
+    # Surface capacity
+    max_cells_setpoint = float(params["max_cells_setpoint"])
+    max_cells_sd = float(params["max_cells_sd"])
 
-    # --- BIO40 inoculation (cells/mL -> cells/MC mean) ---
-    inoc_cells_ml_40 = params["inoc_bio40_cells_ml"]
-    cells_per_g_40 = inoc_cells_ml_40 / MC_BIO40
-    inoc_cells_per_mc_40 = cells_per_g_40 / PARTICLES_PER_G
+    rng_seed = int(params["rng_seed"])
 
-    mean40_tot, std40_tot, mean40_inf, std40_inf = simulate_surface_mc(
-        n_experiments=n,
+    # ---------------- BIO40 ----------------
+    bio40_inoc_ml = float(params["inoc_bio40_cells_ml"])
+    r40 = run_stage_surface_growth(
+        name="BIO40",
+        n=n,
         days=d40,
+        mc_g_per_l=MC_BIO40,
+        particles_per_g=particles_per_g,
         max_cells_setpoint=max_cells_setpoint,
         max_cells_sd=max_cells_sd,
-        inoc_cells_per_mc_mean=inoc_cells_per_mc_40,
-        inoc_cells_per_mc_sd=params["inoc_sd_cells_per_mc_bio40"],
-        rng_seed=params["rng_seed"],
+        inoc_cells_ml=bio40_inoc_ml,
+        inoc_sd_cells_per_mc=float(params["inoc_sd_cells_per_mc_bio40"]),
+        rng_seed=rng_seed,
     )
 
-    t40, bio40_cells_ml, bio40_cells_ml_std, bio40_inf_ml, bio40_inf_ml_std = surface_traj_to_cells_ml_timeseries(
-        mean40_tot, std40_tot, mean40_inf, std40_inf,
-        d40, MC_BIO40, PARTICLES_PER_G, t0_cells_ml=inoc_cells_ml_40
-    )
+    # ---------------- Transfer to BIO200A ----------------
+    tryps_yield_200 = float(params["trypsin_yield_bio200a"])
+    bio200_inoc_ml = tryps_yield_200 * V_BIO40 * r40.end_total_cells_ml / V_BIO200A
 
-    # --- Transfer to BIO200A ---
-    tryps_yield_200 = params["trypsin_yield_bio200a"]
-    inoc_cells_ml_200 = tryps_yield_200 * V_BIO40 * bio40_cells_ml[-1] / V_BIO200A
-
-    cells_per_g_200 = inoc_cells_ml_200 / MC_BIO200A
-    inoc_cells_per_mc_200 = cells_per_g_200 / PARTICLES_PER_G
-
-    mean200_tot, std200_tot, mean200_inf, std200_inf = simulate_surface_mc(
-        n_experiments=n,
+    r200 = run_stage_surface_growth(
+        name="BIO200A",
+        n=n,
         days=d200,
+        mc_g_per_l=MC_BIO200A,
+        particles_per_g=particles_per_g,
         max_cells_setpoint=max_cells_setpoint,
         max_cells_sd=max_cells_sd,
-        inoc_cells_per_mc_mean=inoc_cells_per_mc_200,
-        inoc_cells_per_mc_sd=params["inoc_sd_cells_per_mc_bio200a"],
-        rng_seed=params["rng_seed"] + 1,
+        inoc_cells_ml=bio200_inoc_ml,
+        inoc_sd_cells_per_mc=float(params["inoc_sd_cells_per_mc_bio200a"]),
+        rng_seed=rng_seed + 1,
     )
 
-    t200, bio200_cells_ml, bio200_cells_ml_std, bio200_inf_ml, bio200_inf_ml_std = surface_traj_to_cells_ml_timeseries(
-        mean200_tot, std200_tot, mean200_inf, std200_inf,
-        d200, MC_BIO200A, PARTICLES_PER_G, t0_cells_ml=inoc_cells_ml_200
+    # ---------------- Split to 4x BIO750 ----------------
+    bio200_end_total = r200.end_total_cells_ml
+    tryps_yield_750 = float(params["trypsin_yield_bio750"])
+    dist_factor_EF = float(params["distribution_factor_EF"])
+    dist_factor_GH = float(params["distribution_factor_GH"])
+
+    def bio750_inoc(dist_factor: float) -> float:
+        return dist_factor * tryps_yield_750 * V_BIO200A * bio200_end_total / V_BIO750
+
+    inocE = bio750_inoc(dist_factor_EF)
+    inocF = bio750_inoc(dist_factor_EF)
+    inocG = bio750_inoc(dist_factor_GH)
+    inocH = bio750_inoc(dist_factor_GH)
+
+    r750E = run_stage_surface_growth(
+        name="BIO750E",
+        n=n,
+        days=d750,
+        mc_g_per_l=MC_BIO750,
+        particles_per_g=particles_per_g,
+        max_cells_setpoint=max_cells_setpoint,
+        max_cells_sd=max_cells_sd,
+        inoc_cells_ml=inocE,
+        inoc_sd_cells_per_mc=float(params["inoc_sd_cells_per_mc_bio750"]),
+        rng_seed=rng_seed + 2,
+    )
+    r750F = run_stage_surface_growth(
+        name="BIO750F",
+        n=n,
+        days=d750,
+        mc_g_per_l=MC_BIO750,
+        particles_per_g=particles_per_g,
+        max_cells_setpoint=max_cells_setpoint,
+        max_cells_sd=max_cells_sd,
+        inoc_cells_ml=inocF,
+        inoc_sd_cells_per_mc=float(params["inoc_sd_cells_per_mc_bio750"]),
+        rng_seed=rng_seed + 3,
+    )
+    r750G = run_stage_surface_growth(
+        name="BIO750G",
+        n=n,
+        days=d750,
+        mc_g_per_l=MC_BIO750,
+        particles_per_g=particles_per_g,
+        max_cells_setpoint=max_cells_setpoint,
+        max_cells_sd=max_cells_sd,
+        inoc_cells_ml=inocG,
+        inoc_sd_cells_per_mc=float(params["inoc_sd_cells_per_mc_bio750"]),
+        rng_seed=rng_seed + 4,
+    )
+    r750H = run_stage_surface_growth(
+        name="BIO750H",
+        n=n,
+        days=d750,
+        mc_g_per_l=MC_BIO750,
+        particles_per_g=particles_per_g,
+        max_cells_setpoint=max_cells_setpoint,
+        max_cells_sd=max_cells_sd,
+        inoc_cells_ml=inocH,
+        inoc_sd_cells_per_mc=float(params["inoc_sd_cells_per_mc_bio750"]),
+        rng_seed=rng_seed + 5,
     )
 
-    # --- Split to 4x BIO750 (E/F/G/H) ---
-    bio200_end_total = bio200_cells_ml[-1]
-    tryps_yield_750 = params["trypsin_yield_bio750"]
+    # ---------------- Combine to BIO1500 (inoc only; no growth modeled) ----------------
+    transfer_1500A = float(params["transfer_bio1500a"])
+    transfer_1500B = float(params["transfer_bio1500b"])
 
-    dist_factor_EF = params["distribution_factor_EF"]
-    dist_factor_GH = params["distribution_factor_GH"]
+    inoc_1500A = transfer_1500A * (r750E.end_total_cells_ml * V_BIO750 + r750F.end_total_cells_ml * V_BIO750) / V_BIO1500
+    inoc_1500B = transfer_1500B * (r750G.end_total_cells_ml * V_BIO750 + r750H.end_total_cells_ml * V_BIO750) / V_BIO1500
 
-    def run_750(dist_factor: float, seed_offset: int, stage_name: str):
-        inoc_cells_ml_750 = dist_factor * tryps_yield_750 * V_BIO200A * bio200_end_total / V_BIO750
+    # Make a tiny flat series for display (0h->24h)
+    t1500 = np.array([0.0, 24.0])
+    flat1500A = pd.DataFrame(
+        {"time_h": t1500, "total_cells_ml": [inoc_1500A, inoc_1500A], "infectable_cells_ml": [inoc_1500A, inoc_1500A], "multilayer_cells_ml": [0.0, 0.0]}
+    )
+    flat1500B = pd.DataFrame(
+        {"time_h": t1500, "total_cells_ml": [inoc_1500B, inoc_1500B], "infectable_cells_ml": [inoc_1500B, inoc_1500B], "multilayer_cells_ml": [0.0, 0.0]}
+    )
 
-        cells_per_g_750 = inoc_cells_ml_750 / MC_BIO750
-        inoc_cells_per_mc_750 = cells_per_g_750 / PARTICLES_PER_G
+    # ---------------- Build cumulative-time series for plotting ----------------
+    stage_results = [r40, r200, r750E, r750F, r750G, r750H]
+    series: Dict[str, pd.DataFrame] = {}
 
-        mean750_tot, std750_tot, mean750_inf, std750_inf = simulate_surface_mc(
-            n_experiments=n,
-            days=d750,
-            max_cells_setpoint=max_cells_setpoint,
-            max_cells_sd=max_cells_sd,
-            inoc_cells_per_mc_mean=inoc_cells_per_mc_750,
-            inoc_cells_per_mc_sd=params["inoc_sd_cells_per_mc_bio750"],
-            rng_seed=params["rng_seed"] + seed_offset,
-        )
-
-        t750, total_ml, total_ml_std, inf_ml, inf_ml_std = surface_traj_to_cells_ml_timeseries(
-            mean750_tot, std750_tot, mean750_inf, std750_inf,
-            d750, MC_BIO750, PARTICLES_PER_G, t0_cells_ml=inoc_cells_ml_750
-        )
-
-        df = pd.DataFrame(
-            {
-                "time_h": t750,
-                "cells_ml": total_ml,
-                "cells_ml_std": total_ml_std,
-                "infectable_cells_ml": inf_ml,
-                "infectable_cells_ml_std": inf_ml_std,
-            }
-        )
-
-        return inoc_cells_ml_750, df
-
-    inocE, dfE = run_750(dist_factor_EF, 2, "BIO750E")
-    inocF, dfF = run_750(dist_factor_EF, 3, "BIO750F")
-    inocG, dfG = run_750(dist_factor_GH, 4, "BIO750G")
-    inocH, dfH = run_750(dist_factor_GH, 5, "BIO750H")
-
-    # --- Combine to BIO1500 A/B (inoc only; display flat line) ---
-    transfer_1500A = params["transfer_bio1500a"]
-    transfer_1500B = params["transfer_bio1500b"]
-
-    bio750E_end = dfE["cells_ml"].iloc[-1]
-    bio750F_end = dfF["cells_ml"].iloc[-1]
-    bio750G_end = dfG["cells_ml"].iloc[-1]
-    bio750H_end = dfH["cells_ml"].iloc[-1]
-
-    inoc_1500A = transfer_1500A * ((bio750E_end * V_BIO750) + (bio750F_end * V_BIO750)) / V_BIO1500
-    inoc_1500B = transfer_1500B * ((bio750G_end * V_BIO750) + (bio750H_end * V_BIO750)) / V_BIO1500
-
-    t1500 = np.array([0.0, float(d1500) * 24.0], dtype=float) if d1500 > 0 else np.array([0.0], dtype=float)
-
-    def flat_df(inoc_val: float):
+    def to_df(stage: StageResult) -> pd.DataFrame:
         return pd.DataFrame(
             {
-                "time_h": t1500,
-                "cells_ml": np.full_like(t1500, inoc_val, dtype=float),
-                "cells_ml_std": np.zeros_like(t1500, dtype=float),
-                "infectable_cells_ml": np.full_like(t1500, inoc_val, dtype=float),
-                "infectable_cells_ml_std": np.zeros_like(t1500, dtype=float),
+                "time_h": stage.t_h,
+                "total_cells_ml": stage.total_cells_ml,
+                "infectable_cells_ml": stage.infectable_cells_ml,
+                "multilayer_cells_ml": stage.multilayer_cells_ml,
             }
         )
 
-    df1500A = flat_df(inoc_1500A)
-    df1500B = flat_df(inoc_1500B)
+    series["BIO40"] = to_df(r40)
+    series["BIO200A"] = to_df(r200)
+    series["BIO750E"] = to_df(r750E)
+    series["BIO750F"] = to_df(r750F)
+    series["BIO750G"] = to_df(r750G)
+    series["BIO750H"] = to_df(r750H)
+    series["BIO1500A"] = flat1500A
+    series["BIO1500B"] = flat1500B
 
-    series = {
-        "BIO40": pd.DataFrame(
-            {
-                "time_h": t40,
-                "cells_ml": bio40_cells_ml,
-                "cells_ml_std": bio40_cells_ml_std,
-                "infectable_cells_ml": bio40_inf_ml,
-                "infectable_cells_ml_std": bio40_inf_ml_std,
-            }
-        ),
-        "BIO200A": pd.DataFrame(
-            {
-                "time_h": t200,
-                "cells_ml": bio200_cells_ml,
-                "cells_ml_std": bio200_cells_ml_std,
-                "infectable_cells_ml": bio200_inf_ml,
-                "infectable_cells_ml_std": bio200_inf_ml_std,
-            }
-        ),
-        "BIO750E": dfE,
-        "BIO750F": dfF,
-        "BIO750G": dfG,
-        "BIO750H": dfH,
-        "BIO1500A": df1500A,
-        "BIO1500B": df1500B,
-    }
+    # Cumulative time (sequential train) for BIO40->BIO200A only (these are sequential).
+    # BIO750s run in parallel after BIO200A, so we align their t=0 at cumulative start of BIO750 phase.
+    t0_40 = 0.0
+    t0_200 = float(d40) * 24.0
+    t0_750 = float(d40 + d200) * 24.0
+
+    series["BIO40"]["time_h_cum"] = series["BIO40"]["time_h"] + t0_40
+    series["BIO200A"]["time_h_cum"] = series["BIO200A"]["time_h"] + t0_200
+    for k in ["BIO750E", "BIO750F", "BIO750G", "BIO750H"]:
+        series[k]["time_h_cum"] = series[k]["time_h"] + t0_750
+
+    # BIO1500 is “inoc only” and happens after BIO750 end; show at end of BIO750 window
+    t0_1500 = t0_750 + float(d750) * 24.0
+    series["BIO1500A"]["time_h_cum"] = series["BIO1500A"]["time_h"] + t0_1500
+    series["BIO1500B"]["time_h_cum"] = series["BIO1500B"]["time_h"] + t0_1500
 
     summary = pd.DataFrame(
         [
             {
                 "Stage": "BIO40",
-                "Inoc_cells/mL": inoc_cells_ml_40,
-                "End_cells/mL": float(series["BIO40"]["cells_ml"].iloc[-1]),
-                "End_infectable_cells/mL": float(series["BIO40"]["infectable_cells_ml"].iloc[-1]),
+                "Inoc_cells/mL": r40.inoc_cells_ml,
+                "End_TOTAL_cells/mL": r40.end_total_cells_ml,
+                "End_INFECTABLE_cells/mL": r40.end_infectable_cells_ml,
                 "Days": d40,
                 "MC_g/L": MC_BIO40,
             },
             {
                 "Stage": "BIO200A",
-                "Inoc_cells/mL": inoc_cells_ml_200,
-                "End_cells/mL": float(series["BIO200A"]["cells_ml"].iloc[-1]),
-                "End_infectable_cells/mL": float(series["BIO200A"]["infectable_cells_ml"].iloc[-1]),
+                "Inoc_cells/mL": r200.inoc_cells_ml,
+                "End_TOTAL_cells/mL": r200.end_total_cells_ml,
+                "End_INFECTABLE_cells/mL": r200.end_infectable_cells_ml,
                 "Days": d200,
                 "MC_g/L": MC_BIO200A,
             },
             {
                 "Stage": "BIO750E",
-                "Inoc_cells/mL": inocE,
-                "End_cells/mL": float(dfE["cells_ml"].iloc[-1]),
-                "End_infectable_cells/mL": float(dfE["infectable_cells_ml"].iloc[-1]),
+                "Inoc_cells/mL": r750E.inoc_cells_ml,
+                "End_TOTAL_cells/mL": r750E.end_total_cells_ml,
+                "End_INFECTABLE_cells/mL": r750E.end_infectable_cells_ml,
                 "Days": d750,
                 "MC_g/L": MC_BIO750,
             },
             {
                 "Stage": "BIO750F",
-                "Inoc_cells/mL": inocF,
-                "End_cells/mL": float(dfF["cells_ml"].iloc[-1]),
-                "End_infectable_cells/mL": float(dfF["infectable_cells_ml"].iloc[-1]),
+                "Inoc_cells/mL": r750F.inoc_cells_ml,
+                "End_TOTAL_cells/mL": r750F.end_total_cells_ml,
+                "End_INFECTABLE_cells/mL": r750F.end_infectable_cells_ml,
                 "Days": d750,
                 "MC_g/L": MC_BIO750,
             },
             {
                 "Stage": "BIO750G",
-                "Inoc_cells/mL": inocG,
-                "End_cells/mL": float(dfG["cells_ml"].iloc[-1]),
-                "End_infectable_cells/mL": float(dfG["infectable_cells_ml"].iloc[-1]),
+                "Inoc_cells/mL": r750G.inoc_cells_ml,
+                "End_TOTAL_cells/mL": r750G.end_total_cells_ml,
+                "End_INFECTABLE_cells/mL": r750G.end_infectable_cells_ml,
                 "Days": d750,
                 "MC_g/L": MC_BIO750,
             },
             {
                 "Stage": "BIO750H",
-                "Inoc_cells/mL": inocH,
-                "End_cells/mL": float(dfH["cells_ml"].iloc[-1]),
-                "End_infectable_cells/mL": float(dfH["infectable_cells_ml"].iloc[-1]),
+                "Inoc_cells/mL": r750H.inoc_cells_ml,
+                "End_TOTAL_cells/mL": r750H.end_total_cells_ml,
+                "End_INFECTABLE_cells/mL": r750H.end_infectable_cells_ml,
                 "Days": d750,
                 "MC_g/L": MC_BIO750,
             },
             {
                 "Stage": "BIO1500A",
                 "Inoc_cells/mL": inoc_1500A,
-                "End_cells/mL": inoc_1500A,
-                "End_infectable_cells/mL": inoc_1500A,
-                "Days": d1500,
+                "End_TOTAL_cells/mL": inoc_1500A,
+                "End_INFECTABLE_cells/mL": inoc_1500A,
+                "Days": 0,
                 "MC_g/L": np.nan,
             },
             {
                 "Stage": "BIO1500B",
                 "Inoc_cells/mL": inoc_1500B,
-                "End_cells/mL": inoc_1500B,
-                "End_infectable_cells/mL": inoc_1500B,
-                "Days": d1500,
+                "End_TOTAL_cells/mL": inoc_1500B,
+                "End_INFECTABLE_cells/mL": inoc_1500B,
+                "Days": 0,
                 "MC_g/L": np.nan,
             },
         ]
@@ -453,47 +550,51 @@ def run_seed_train(params):
 # ----------------------------
 # Plotting
 # ----------------------------
-def plot_all_bioreactors_one_plot(series: dict, ycol: str):
+def plot_all_bioreactors_one_plot(series: Dict[str, pd.DataFrame], y_col: str, title: str):
     fig = plt.figure(figsize=(12, 7))
     ax = fig.add_subplot(111)
 
     for name, df in series.items():
-        ax.plot(df["time_h"], df[ycol], marker="o", label=name)
+        if "time_h_cum" in df.columns:
+            x = df["time_h_cum"]
+        else:
+            x = df["time_h"]
+        ax.plot(x, df[y_col], marker="o", label=name)
 
-    ax.set_xlabel("Time (h)")
+    ax.set_xlabel("Time (h) — cumulative")
     ax.set_ylabel("Cells / mL")
     ax.grid(True, which="both", linestyle=":")
     ax.legend()
+    ax.set_title(title)
     return fig
 
 
-# ----------------------------
-# Export ZIP of CSVs
-# ----------------------------
-def export_zip_csv(series: dict, summary: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("Summary.csv", summary.to_csv(index=False))
-        for name, df in series.items():
-            zf.writestr(f"{name}.csv", df.to_csv(index=False))
-    return buf.getvalue()
+def export_zip_csv(series: Dict[str, pd.DataFrame], summary: pd.DataFrame) -> bytes:
+    """Export summary + each series as separate CSVs in a ZIP (no openpyxl dependency)."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("summary.csv", summary.to_csv(index=False))
+        for k, df in series.items():
+            safe = k.replace("/", "_")
+            zf.writestr(f"{safe}.csv", df.to_csv(index=False))
+    return buffer.getvalue()
 
 
 # ----------------------------
 # Streamlit UI
 # ----------------------------
 st.set_page_config(page_title="Seed Train Monte Carlo (Cytodex)", layout="wide")
-st.title("Seed Train Monte Carlo (Cytodex surface model) — Infectable cells included")
+st.title("Seed Train Monte Carlo (Cytodex surface model)")
+st.caption("Option 1 active: **Infectable = OCCUPIED + NEWLY_OCCUPIED + INHIBITED** (MULTILAYER = non-infectable)")
 
 with st.sidebar:
     st.header("Run controls")
-    n_experiments = st.slider("Monte Carlo experiments (n)", 10, 2000, 100, step=10)
+    n_experiments = st.slider("Monte Carlo experiments (n)", 10, 5000, 100, step=10)
 
     st.subheader("Days per bioreactor")
     days_bio40 = st.slider("BIO40 days", 1, 14, 6)
     days_bio200a = st.slider("BIO200A days", 1, 14, 6)
     days_bio750 = st.slider("BIO750 (E/F/G/H) days", 1, 14, 6)
-    days_bio1500 = st.slider("BIO1500 (A/B) days (display only)", 0, 14, 0)
 
     st.subheader("Surface capacity")
     max_cells_setpoint = st.slider("Max cells/MC setpoint", 50, 300, 140)
@@ -528,10 +629,13 @@ with st.sidebar:
     rng_seed = st.number_input("RNG seed", value=1, step=1)
 
     st.subheader("Plot selection")
-    plot_infectable = st.checkbox("Plot infectable cells (monolayer accessible)", value=False)
+    y_choice = st.radio(
+        "Plot metric",
+        options=["TOTAL cells/mL", "INFECTABLE cells/mL", "MULTILAYER cells/mL"],
+        index=1,
+    )
 
     run_btn = st.button("Run simulation")
-
 
 if run_btn:
     params = dict(
@@ -539,7 +643,6 @@ if run_btn:
         days_bio40=int(days_bio40),
         days_bio200a=int(days_bio200a),
         days_bio750=int(days_bio750),
-        days_bio1500=int(days_bio1500),
         max_cells_setpoint=float(max_cells_setpoint),
         max_cells_sd=float(max_cells_sd),
         particles_per_g=float(particles_per_g),
@@ -562,12 +665,21 @@ if run_btn:
     with st.spinner("Running Monte Carlo…"):
         series, summary = run_seed_train(params)
 
+    if y_choice == "TOTAL cells/mL":
+        y_col = "total_cells_ml"
+        title = "All bioreactors — TOTAL cells/mL vs cumulative time"
+    elif y_choice == "INFECTABLE cells/mL":
+        y_col = "infectable_cells_ml"
+        title = "All bioreactors — INFECTABLE cells/mL (Option 1) vs cumulative time"
+    else:
+        y_col = "multilayer_cells_ml"
+        title = "All bioreactors — MULTILAYER cells/mL vs cumulative time"
+
     col1, col2 = st.columns([2, 1], gap="large")
 
     with col1:
-        st.subheader("All bioreactors — one plot (cells/mL vs time)")
-        ycol = "infectable_cells_ml" if plot_infectable else "cells_ml"
-        fig = plot_all_bioreactors_one_plot(series, ycol=ycol)
+        st.subheader(title)
+        fig = plot_all_bioreactors_one_plot(series, y_col=y_col, title=title)
         st.pyplot(fig, use_container_width=True)
 
     with col2:
@@ -588,5 +700,9 @@ if run_btn:
         with tab:
             st.dataframe(df, use_container_width=True)
 
+    st.info(
+        "Interpretation: **INFECTABLE** includes INHIBITED (monolayer-accessible), "
+        "and excludes MULTILAYER (not accessible). TOTAL should never decrease within a stage."
+    )
 else:
-    st.info("Set parameters in the sidebar and click Run simulation.")
+    st.info("Set parameters in the sidebar and click **Run simulation**.")
