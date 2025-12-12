@@ -1,6 +1,7 @@
 # streamlit_app.py
 # Seed Train Monte Carlo (Cytodex surface model)
-# Fix: include Day-0 in MC output (no forced inoc point -> no artificial drops)
+# Fix: Day-0 comes from the model (no forced inoc point -> no artificial drops)
+# Fix: simulate_surface_mc trajectories stored correctly per metric
 # Option 1: Infectable = OCCUPIED + NEWLY_OCCUPIED + INHIBITED (MULTILAYER non-infectable)
 
 import io
@@ -99,7 +100,7 @@ def count_states(grid: np.ndarray) -> Dict[str, int]:
 
 
 # ----------------------------
-# Monte Carlo simulation (now includes Day-0)
+# Monte Carlo simulation (includes Day-0)  ✅ FIXED
 # ----------------------------
 def simulate_surface_mc(
     n_experiments: int,
@@ -127,7 +128,6 @@ def simulate_surface_mc(
         "INFECTABLE_TOTAL",
     ]
 
-    # store list of arrays per metric, each array shape = (days+1,)
     traj_by_metric = {m: [] for m in metrics}
 
     for _ in range(n_experiments):
@@ -135,8 +135,7 @@ def simulate_surface_mc(
         grid_size = max(2, int(round(math.sqrt(max_cells))))
 
         inoc_cells = float(max(0.0, np.random.normal(inoc_cells_per_mc_mean, inoc_cells_per_mc_sd)))
-        # cap to surface capacity
-        inoc_density = min(1.0, inoc_cells / float(grid_size * grid_size))
+        inoc_density = min(1.0, inoc_cells / float(grid_size * grid_size))  # cap at surface capacity
 
         grid = np.zeros((grid_size, grid_size), dtype=int)
         multilayer_cycle_grid = np.zeros((grid_size, grid_size), dtype=int)
@@ -150,10 +149,9 @@ def simulate_surface_mc(
                 x, y = divmod(pos, grid_size)
                 grid[x, y] = OCCUPIED
 
-        # ---- Day 0 counts (IMPORTANT FIX)
+        # ---- Day 0 counts
         counts0 = count_states(grid)
-        for m in metrics:
-            traj = [counts0[m]]
+        traj = {m: [float(counts0[m])] for m in metrics}
 
         prev_total = counts0["OCCUPIED_TOTAL"]
 
@@ -162,20 +160,20 @@ def simulate_surface_mc(
             grid, multilayer_cycle_grid = update_state(grid, multilayer_cycle_grid)
             counts = count_states(grid)
 
-            # within-stage monotonicity (no death in model)
+            # model has no death; should be monotone within stage
             if counts["OCCUPIED_TOTAL"] < prev_total:
                 raise RuntimeError("BUG: OCCUPIED_TOTAL decreased within a stage.")
             prev_total = counts["OCCUPIED_TOTAL"]
 
             for m in metrics:
-                traj.append(counts[m])
+                traj[m].append(float(counts[m]))
 
             # commit NEWLY_OCCUPIED to OCCUPIED for next step
             grid[grid == NEWLY_OCCUPIED] = OCCUPIED
 
-        # store experiment trajectories
+        # store per-metric trajectory arrays (each must be length days+1)
         for m in metrics:
-            traj_by_metric[m].append(np.array(traj, dtype=float))
+            traj_by_metric[m].append(np.array(traj[m], dtype=float))
 
     mean_dict, std_dict = {}, {}
     for m in metrics:
@@ -198,8 +196,8 @@ def mc_to_cells_ml(mean_cells_per_mc: np.ndarray, std_cells_per_mc: np.ndarray, 
 
 def cells_ml_to_cells_per_mc(inoc_cells_ml: float, mc_g_per_l: float, particles_per_g: float) -> float:
     """
-    FIXED: cells/mL -> cells/MC.
-    mc_g_per_l is g/L, so g/mL = mc_g_per_l / 1000.
+    cells/mL -> cells/MC.
+    g/mL = mc_g_per_l / 1000
     cells/g = (cells/mL) / (g/mL) = cells/mL * 1000 / (mc_g/L)
     cells/MC = (cells/g) / (particles/g)
     """
@@ -242,10 +240,6 @@ def run_stage_surface_growth(
     inoc_sd_cells_per_mc: float,
     rng_seed: int,
 ) -> StageResult:
-    """
-    Runs a stage with surface growth model.
-    Key fix: Day-0 comes from the simulation itself -> no artificial drops.
-    """
     inoc_cells_per_mc_mean = cells_ml_to_cells_per_mc(inoc_cells_ml, mc_g_per_l, particles_per_g)
 
     mean_df, std_df = simulate_surface_mc(
@@ -258,10 +252,8 @@ def run_stage_surface_growth(
         rng_seed=rng_seed,
     )
 
-    # time axis includes day0
     t_h = np.arange(0, days + 1, dtype=float) * 24.0
 
-    # convert MC metrics to cells/mL (includes day0)
     total_ml, total_ml_std = mc_to_cells_ml(
         mean_df["OCCUPIED_TOTAL"].to_numpy(),
         std_df["OCCUPIED_TOTAL"].to_numpy(),
@@ -281,7 +273,6 @@ def run_stage_surface_growth(
         particles_per_g,
     )
 
-    # effective inoc = model day0 (after seeding, capped by surface)
     inoc_effective_ml = float(total_ml[0])
 
     return StageResult(
@@ -382,7 +373,6 @@ def run_seed_train(params: dict):
     inoc_1500A = transfer_1500A * (r750E.end_total_cells_ml * V_BIO750 + r750F.end_total_cells_ml * V_BIO750) / V_BIO1500
     inoc_1500B = transfer_1500B * (r750G.end_total_cells_ml * V_BIO750 + r750H.end_total_cells_ml * V_BIO750) / V_BIO1500
 
-    # Build per-stage dataframes (time_h is stage-local)
     def to_df(stage: StageResult) -> pd.DataFrame:
         return pd.DataFrame({
             "time_h": stage.t_h,
@@ -476,13 +466,13 @@ with st.sidebar:
     n_experiments = st.slider("Monte Carlo experiments (n)", 10, 5000, 100, step=10)
 
     st.subheader("Days per bioreactor")
-    days_bio40 = st.slider("BIO40 days", 1, 14, 6)
-    days_bio200a = st.slider("BIO200A days", 1, 14, 6)
-    days_bio750 = st.slider("BIO750 (E/F/G/H) days", 1, 14, 6)
+    days_bio40 = st.slider("BIO40 days", 1, 200, 6)
+    days_bio200a = st.slider("BIO200A days", 1, 200, 6)
+    days_bio750 = st.slider("BIO750 (E/F/G/H) days", 1, 200, 6)
 
     st.subheader("Surface capacity")
-    max_cells_setpoint = st.slider("Max cells/MC setpoint", 50, 300, 140)
-    max_cells_sd = st.slider("Max cells/MC SD", 0.0, 80.0, 23.0)
+    max_cells_setpoint = st.slider("Max cells/MC setpoint", 50, 60000, 140)
+    max_cells_sd = st.slider("Max cells/MC SD", 0.0, 8000.0, 23.0)
 
     st.subheader("Microcarriers / particles")
     particles_per_g = st.number_input("Particles per g Cytodex", value=7087.0, step=1.0)
