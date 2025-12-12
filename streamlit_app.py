@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import numpy as np
-import pandas as pd
+import pandas as p
 import matplotlib.pyplot as plt
 import streamlit as st
 
