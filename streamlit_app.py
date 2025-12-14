@@ -280,7 +280,6 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     # Helper: build df from simulation output
     def build_df(name: str, days: int, mc_g_per_l: float, sim_out: dict, t_offset_days: float) -> pd.DataFrame:
         time_days = None
-        df = None
 
         cols = {}
         for metric in ("TOTAL", "INFECTABLE", "MULTILAYER"):
@@ -543,7 +542,9 @@ with st.sidebar:
     # BIO200A oxygen limitation defaults
     st.subheader("BIO200A oxygen limitation")
     limit_bio200_oxygen = st.checkbox("Enable O2-limited growth in BIO200A", value=True)
-    bio200_limit_start_day = st.slider("Start day (BIO200A)", 0, int(days_bio200a), 4)
+    # default day = 4; clamp to slider max to avoid Streamlit value error
+    default_start_day = min(4, int(days_bio200a))
+    bio200_limit_start_day = st.slider("Start day (BIO200A)", 0, int(days_bio200a), default_start_day)
     bio200_spread_fraction = st.slider(
         "Growth throttle (fraction of cells that can spread)",
         0.0, 1.0, 0.15, step=0.01
@@ -608,6 +609,100 @@ if run_btn:
             file_name=f"seed_train_sim_n{int(n_experiments)}.zip",
             mime="application/zip",
         )
+
+    # -------------------------------------------------------------------------
+    # EXTRA PLOT: BIO750E MC sweep (0..6 g/L) for TOTAL and INFECTABLE cells/mL
+    # -------------------------------------------------------------------------
+    st.subheader("BIO750E — MC sweep (0–6 g/L) impact on cells/mL")
+
+    # Pull BIO750E inoculum (cells/mL) from the summary table
+    inoc750E_cells_ml = None
+    try:
+        inoc750E_cells_ml = float(summary.loc[summary["Stage"] == "BIO750E", "Inoc_cells/mL"].iloc[0])
+    except Exception:
+        inoc750E_cells_ml = None
+
+    if inoc750E_cells_ml is None or (isinstance(inoc750E_cells_ml, float) and np.isnan(inoc750E_cells_ml)):
+        st.warning("Could not determine BIO750E inoculation from summary; MC sweep plot skipped.")
+    else:
+        mc_sweep = list(range(0, 7))  # 0,1,2,3,4,5,6 g/L
+        d750_local = int(days_bio750)
+
+        beads_per_g_local = float(beads_per_mg) * 1000.0
+
+        sweep_rows = []
+        for mc_val_int in mc_sweep:
+            mc_val = float(mc_val_int)
+
+            if mc_val <= 0.0:
+                # MC=0 means no beads -> cells/mL effectively 0 in this model
+                for day in range(d750_local + 1):
+                    sweep_rows.append({
+                        "day": float(day),
+                        "MC_g/L": mc_val,
+                        "TOTAL_cells/mL": 0.0,
+                        "INFECTABLE_cells/mL": 0.0
+                    })
+                continue
+
+            bml = beads_per_ml_from_mc(mc_val, beads_per_g_local)
+
+            # Convert inoc cells/mL -> inoc cells/bead for this MC level
+            inoc_cells_per_mc = 0.0 if bml <= 0 else float(inoc750E_cells_ml / bml)
+
+            # Re-run surface model for BIO750E at this MC level
+            sim750_mc = simulate_surface_mc(
+                n_experiments=int(n_experiments),
+                days=d750_local,
+                max_cells_setpoint=float(max_cells_setpoint),
+                max_cells_sd=float(max_cells_sd),
+                inoc_cells_per_mc_mean=float(inoc_cells_per_mc),
+                inoc_cells_per_mc_sd=float(inoc_sd_bio750),     # SD remains in cells/MC units
+                rng_seed=int(rng_seed) + 100 + mc_val_int,      # de-correlate runs
+            )
+
+            # Convert cells/bead trajectories -> cells/mL trajectories
+            time_days, total_ml, _ = cells_ml_from_cells_per_mc(
+                sim750_mc["TOTAL"][0], sim750_mc["TOTAL"][1],
+                mc_val, beads_per_g_local, d750_local
+            )
+            _, inf_ml, _ = cells_ml_from_cells_per_mc(
+                sim750_mc["INFECTABLE"][0], sim750_mc["INFECTABLE"][1],
+                mc_val, beads_per_g_local, d750_local
+            )
+
+            for k in range(len(time_days)):
+                sweep_rows.append({
+                    "day": float(time_days[k]),
+                    "MC_g/L": mc_val,
+                    "TOTAL_cells/mL": float(total_ml[k]),
+                    "INFECTABLE_cells/mL": float(inf_ml[k]),
+                })
+
+        df_sweep = pd.DataFrame(sweep_rows)
+
+        fig_sweep, axs = plt.subplots(2, 1, figsize=(12, 9), sharex=True)
+
+        for mc_val_int in mc_sweep:
+            mc_val = float(mc_val_int)
+            dfx = df_sweep[df_sweep["MC_g/L"] == mc_val].sort_values("day")
+            axs[0].plot(dfx["day"], dfx["TOTAL_cells/mL"], marker="o", label=f"{mc_val_int} g/L")
+            axs[1].plot(dfx["day"], dfx["INFECTABLE_cells/mL"], marker="o", label=f"{mc_val_int} g/L")
+
+        axs[0].set_title("BIO750E — TOTAL cells/mL vs days (MC sweep)")
+        axs[0].set_ylabel("Cells / mL")
+        axs[0].grid(True, which="both", linestyle=":")
+        axs[0].legend(title="MC (g/L)", ncol=4)
+
+        axs[1].set_title("BIO750E — INFECTABLE cells/mL vs days (MC sweep)")
+        axs[1].set_xlabel("Time (days)")
+        axs[1].set_ylabel("Cells / mL")
+        axs[1].grid(True, which="both", linestyle=":")
+
+        st.pyplot(fig_sweep, use_container_width=True)
+
+        with st.expander("Show BIO750E MC sweep data table"):
+            st.dataframe(df_sweep, use_container_width=True)
 
     st.subheader("Raw time series (per bioreactor)")
     tabs = st.tabs(list(series.keys()))
