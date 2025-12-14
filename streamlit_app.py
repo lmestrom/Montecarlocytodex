@@ -40,8 +40,6 @@ def update_state(
             if grid[i, j] == OCCUPIED:
 
                 # oxygen-limitation throttle
-                # Only a fraction of occupied cells attempt to spread this day.
-                # If they don't attempt, they remain OCCUPIED (not inhibited).
                 if random.random() > spread_fraction:
                     continue
 
@@ -203,7 +201,6 @@ def cells_ml_from_cells_per_mc(
     """
     cells/mL = (beads/mL) * (cells/bead)
     mean_cells_per_mc/std_cells_per_mc must be length (days+1).
-    time_days will be length (days+1) with 0,1,2,...
     """
     bml = beads_per_ml_from_mc(mc_g_per_l, beads_per_g)
     cells_ml = bml * mean_cells_per_mc
@@ -245,6 +242,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     V_BIO200A = 200000.0
     V_BIO750 = 750000.0
 
+    # Beads per g (user gives beads/mg)
     beads_per_g = params["beads_per_mg"] * 1000.0
 
     # MC (g/L)
@@ -478,18 +476,20 @@ with st.sidebar:
     st.subheader("Inoculation")
     inoc_bio40_cells_ml = st.number_input("BIO40 inoculation (cells/mL)", value=48000.0, step=1000.0)
 
+    # --- Change defaults per your request ---
     st.subheader("Transfer / trypsin yields")
-    trypsin_yield_bio200a = st.slider("Trypsin yield BIO200A", 0.6, 1.0, 0.90, step=0.01)
-    trypsin_yield_bio750 = st.slider("Trypsin yield BIO750", 0.6, 1.0, 0.87, step=0.01)
+    trypsin_yield_bio200a = st.slider("Trypsin yield BIO200A", 0.6, 1.0, 0.80, step=0.01)  # default 0.8
+    trypsin_yield_bio750 = st.slider("Trypsin yield BIO750", 0.6, 1.0, 0.70, step=0.01)   # default 0.7
 
     st.subheader("Distribution factors")
     distribution_factor_EF = st.number_input("Distribution factor (E/F)", value=1.05 / 4, step=0.01)
     distribution_factor_GH = st.number_input("Distribution factor (G/H)", value=0.95 / 4, step=0.01)
 
+    # --- SD per MC fixed to 3 by default in all cases ---
     st.subheader("Inoculation SD (cells/MC)")
-    inoc_sd_bio40 = st.number_input("BIO40 inoc SD (cells/MC)", value=2.94, step=0.1)
-    inoc_sd_bio200a = st.number_input("BIO200A inoc SD (cells/MC)", value=1.0, step=0.1)
-    inoc_sd_bio750 = st.number_input("BIO750 inoc SD (cells/MC)", value=2.2, step=0.1)
+    inoc_sd_bio40 = st.number_input("BIO40 inoc SD (cells/MC)", value=3.0, step=0.1)
+    inoc_sd_bio200a = st.number_input("BIO200A inoc SD (cells/MC)", value=3.0, step=0.1)
+    inoc_sd_bio750 = st.number_input("BIO750 inoc SD (cells/MC)", value=3.0, step=0.1)
 
     # BIO200A oxygen limitation defaults
     st.subheader("BIO200A oxygen limitation")
@@ -570,7 +570,7 @@ if run_btn:
     if inoc750E_cells_ml is None or (isinstance(inoc750E_cells_ml, float) and np.isnan(inoc750E_cells_ml)):
         st.warning("Could not determine BIO750E inoculation from summary; MC sweep plot skipped.")
     else:
-        mc_sweep = list(range(0, 7))  # 0,1,2,3,4,5,6 g/L
+        mc_sweep = list(range(0, 7))  # 0..6 g/L
         d750_local = int(days_bio750)
 
         beads_per_g_local = float(beads_per_mg) * 1000.0
@@ -580,7 +580,6 @@ if run_btn:
             mc_val = float(mc_val_int)
 
             if mc_val <= 0.0:
-                # MC=0 means no beads -> cells/mL effectively 0 in this model
                 for day in range(d750_local + 1):
                     sweep_rows.append({
                         "day": float(day),
@@ -591,22 +590,18 @@ if run_btn:
                 continue
 
             bml = beads_per_ml_from_mc(mc_val, beads_per_g_local)
-
-            # Convert inoc cells/mL -> inoc cells/bead for this MC level
             inoc_cells_per_mc = 0.0 if bml <= 0 else float(inoc750E_cells_ml / bml)
 
-            # Re-run surface model for BIO750E at this MC level
             sim750_mc = simulate_surface_mc(
                 n_experiments=int(n_experiments),
                 days=d750_local,
                 max_cells_setpoint=float(max_cells_setpoint),
                 max_cells_sd=float(max_cells_sd),
                 inoc_cells_per_mc_mean=float(inoc_cells_per_mc),
-                inoc_cells_per_mc_sd=float(inoc_sd_bio750),     # SD remains in cells/MC units
-                rng_seed=int(rng_seed) + 100 + mc_val_int,      # de-correlate runs
+                inoc_cells_per_mc_sd=float(inoc_sd_bio750),
+                rng_seed=int(rng_seed) + 100 + mc_val_int,
             )
 
-            # Convert cells/bead trajectories -> cells/mL trajectories
             time_days, total_ml, _ = cells_ml_from_cells_per_mc(
                 sim750_mc["TOTAL"][0], sim750_mc["TOTAL"][1],
                 mc_val, beads_per_g_local, d750_local
