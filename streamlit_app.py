@@ -9,11 +9,8 @@ from typing import Dict, Tuple, Callable, Optional
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
-
-# Plotly for prettier, interactive plots
-import plotly.express as px
-import plotly.graph_objects as go
 
 # ----------------------------
 # Core grid model (surface only)
@@ -43,6 +40,8 @@ def update_state(
             if grid[i, j] == OCCUPIED:
 
                 # oxygen-limitation throttle
+                # Only a fraction of occupied cells attempt to spread this day.
+                # If they don't attempt, they remain OCCUPIED (not inhibited).
                 if random.random() > spread_fraction:
                     continue
 
@@ -117,9 +116,6 @@ def simulate_surface_mc(
     Returns mean & std trajectories for:
       TOTAL, INFECTABLE, MULTILAYER
     Each trajectory is length (days+1) including day0 (initial state).
-
-    spread_fraction_by_day(day_index) -> float in [0,1]
-      day_index is 0-based (0 = first simulated day step)
     """
     random.seed(rng_seed)
     np.random.seed(rng_seed)
@@ -147,6 +143,7 @@ def simulate_surface_mc(
                 x, y = divmod(pos, grid_size)
                 grid[x, y] = OCCUPIED
 
+        # day 0 counts
         c0 = count_states(grid)
         series_total = [c0["TOTAL"]]
         series_inf = [c0["INFECTABLE"]]
@@ -168,6 +165,7 @@ def simulate_surface_mc(
             series_inf.append(counts["INFECTABLE"])
             series_mul.append(counts["MULTILAYER"])
 
+            # commit newly occupied -> occupied
             grid[grid == NEWLY_OCCUPIED] = OCCUPIED
 
         traj_total.append(np.array(series_total, dtype=float))
@@ -205,6 +203,7 @@ def cells_ml_from_cells_per_mc(
     """
     cells/mL = (beads/mL) * (cells/bead)
     mean_cells_per_mc/std_cells_per_mc must be length (days+1).
+    time_days will be length (days+1) with 0,1,2,...
     """
     bml = beads_per_ml_from_mc(mc_g_per_l, beads_per_g)
     cells_ml = bml * mean_cells_per_mc
@@ -236,7 +235,7 @@ class StageResult:
 
 def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
     """
-    BIO40 -> BIO200A -> BIO750E/F/G/H -> BIO1500A/B (mix only)
+    BIO40 -> BIO200A -> BIO750E/F/G/H
     Returns:
       series dict: each df has time_days, time_days_cum, TOTAL, INFECTABLE, MULTILAYER (+ std)
       summary table
@@ -245,32 +244,36 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     V_BIO40 = 40000.0
     V_BIO200A = 200000.0
     V_BIO750 = 750000.0
-    V_BIO1500 = 1500000.0
 
     beads_per_g = params["beads_per_mg"] * 1000.0
 
+    # MC (g/L)
     MC_BIO40 = params["mc_bio40_g_per_l"]
     MC_BIO200A = params["mc_bio200a_g_per_l"]
     MC_BIO750 = params["mc_bio750_g_per_l"]
 
+    # days
     d40 = params["days_bio40"]
     d200 = params["days_bio200a"]
     d750 = params["days_bio750"]
-    d1500 = params["days_bio1500"]
 
     n = params["n_experiments"]
 
+    # Surface model parameters
     max_cells_setpoint = params["max_cells_setpoint"]
     max_cells_sd = params["max_cells_sd"]
 
+    # Helper: convert cells/mL inoc to cells/MC for grid seeding
     def inoc_cells_per_mc_from_cells_ml(cells_ml: float, mc_g_per_l: float) -> float:
         bml = beads_per_ml_from_mc(mc_g_per_l, beads_per_g)
         if bml <= 0:
             return 0.0
         return float(cells_ml / bml)
 
+    # Helper: build df from simulation output
     def build_df(name: str, days: int, mc_g_per_l: float, sim_out: dict, t_offset_days: float) -> pd.DataFrame:
         time_days = None
+
         cols = {}
         for metric in ("TOTAL", "INFECTABLE", "MULTILAYER"):
             mean_mc, std_mc = sim_out[metric]
@@ -290,7 +293,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     results: Dict[str, pd.DataFrame] = {}
     summary_rows: list[StageResult] = []
 
-    # BIO40
+    # ---------------- BIO40 ----------------
     inoc40_cells_ml = params["inoc_bio40_cells_ml"]
     inoc40_cells_per_mc = inoc_cells_per_mc_from_cells_ml(inoc40_cells_ml, MC_BIO40)
 
@@ -319,7 +322,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
         end_cells_ml_multilayer=end40_mul,
     ))
 
-    # BIO200A
+    # ---------------- BIO200A (transfer + O2 limit) ----------------
     tryps200 = params["trypsin_yield_bio200a"]
     inoc200_cells_ml = tryps200 * V_BIO40 * end40_total / V_BIO200A
     inoc200_cells_per_mc = inoc_cells_per_mc_from_cells_ml(inoc200_cells_ml, MC_BIO200A)
@@ -356,7 +359,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
         end_cells_ml_multilayer=end200_mul,
     ))
 
-    # 4x BIO750
+    # ---------------- 4x BIO750 (split) ----------------
     tryps750 = params["trypsin_yield_bio750"]
     dist_EF = params["distribution_factor_EF"]
     dist_GH = params["distribution_factor_GH"]
@@ -397,51 +400,6 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     results["BIO750G"] = run_750("G", dist_GH, 4)
     results["BIO750H"] = run_750("H", dist_GH, 5)
 
-    # BIO1500 (mix only)
-    transferA = params["transfer_bio1500a"]
-    transferB = params["transfer_bio1500b"]
-
-    endE = float(results["BIO750E"]["TOTAL_cells_ml"].iloc[-1])
-    endF = float(results["BIO750F"]["TOTAL_cells_ml"].iloc[-1])
-    endG = float(results["BIO750G"]["TOTAL_cells_ml"].iloc[-1])
-    endH = float(results["BIO750H"]["TOTAL_cells_ml"].iloc[-1])
-
-    inoc1500A = transferA * ((endE * V_BIO750) + (endF * V_BIO750)) / V_BIO1500
-    inoc1500B = transferB * ((endG * V_BIO750) + (endH * V_BIO750)) / V_BIO1500
-
-    t1500 = np.array([0.0, float(max(0, d1500))], dtype=float)
-    offset1500 = float(d40 + d200 + d750)
-
-    def mix_df(name: str, inoc_ml: float) -> pd.DataFrame:
-        df = pd.DataFrame({"time_days": t1500})
-        df["time_days_cum"] = df["time_days"] + offset1500
-        df["TOTAL_cells_ml"] = [inoc_ml, inoc_ml]
-        df["INFECTABLE_cells_ml"] = [inoc_ml, inoc_ml]
-        df["MULTILAYER_cells_ml"] = [0.0, 0.0]
-        df["TOTAL_cells_ml_std"] = [0.0, 0.0]
-        df["INFECTABLE_cells_ml_std"] = [0.0, 0.0]
-        df["MULTILAYER_cells_ml_std"] = [0.0, 0.0]
-        df["stage"] = name
-        return df
-
-    results["BIO1500A"] = mix_df("BIO1500A", float(inoc1500A))
-    results["BIO1500B"] = mix_df("BIO1500B", float(inoc1500B))
-
-    summary_rows.append(StageResult(
-        name="BIO1500A", days=d1500, mc_g_per_l=None,
-        inoc_cells_ml=float(inoc1500A),
-        end_cells_ml_total=float(inoc1500A),
-        end_cells_ml_infectable=float(inoc1500A),
-        end_cells_ml_multilayer=0.0,
-    ))
-    summary_rows.append(StageResult(
-        name="BIO1500B", days=d1500, mc_g_per_l=None,
-        inoc_cells_ml=float(inoc1500B),
-        end_cells_ml_total=float(inoc1500B),
-        end_cells_ml_infectable=float(inoc1500B),
-        end_cells_ml_multilayer=0.0,
-    ))
-
     summary = pd.DataFrame([{
         "Stage": r.name,
         "Days": r.days,
@@ -455,197 +413,106 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     return results, summary
 
 
-# ----------------------------
-# Prettier plot helpers (Plotly)
-# ----------------------------
-def plot_all_bioreactors_plotly(series: Dict[str, pd.DataFrame], metric: str) -> go.Figure:
+def plot_all_bioreactors_one_plot(series: Dict[str, pd.DataFrame], metric: str):
+    """
+    metric in {"TOTAL", "INFECTABLE", "MULTILAYER"}
+    plots <metric>_cells_ml vs time_days_cum
+    """
+    fig = plt.figure(figsize=(12, 7))
+    ax = fig.add_subplot(111)
+
     col = f"{metric}_cells_ml"
-    fig = go.Figure()
+
     for name, df in series.items():
-        fig.add_trace(go.Scatter(
-            x=df["time_days_cum"],
-            y=df[col],
-            mode="lines+markers",
-            name=name,
-        ))
-    fig.update_layout(
-        template="simple_white",
-        title=f"All bioreactors — {metric} cells/mL vs cumulative days",
-        xaxis_title="Time (days) — cumulative",
-        yaxis_title="Cells / mL",
-        legend_title="Stage",
-        margin=dict(l=20, r=20, t=60, b=20),
-        height=520,
-    )
-    fig.update_xaxes(showgrid=True)
-    fig.update_yaxes(showgrid=True)
+        ax.plot(df["time_days_cum"], df[col], marker="o", linewidth=2, label=name)
+
+    ax.set_title(f"All bioreactors — {metric} cells/mL vs cumulative days")
+    ax.set_xlabel("Time (days) — cumulative")
+    ax.set_ylabel("Cells / mL")
+    ax.grid(True, which="both", linestyle=":")
+    ax.legend(ncol=2)
     return fig
 
 
-def kpi_block(summary: pd.DataFrame) -> dict:
-    """Compute headline KPIs from the last stage entries."""
-    # Choose the last non-empty stage as "final"
-    # (BIO1500A/B are mix-only; still meaningful)
-    final_row = summary.iloc[-1].copy()
-
-    final_total = float(final_row["End_TOTAL_cells/mL"])
-    final_inf = float(final_row["End_INFECTABLE_cells/mL"])
-    final_mul = float(final_row["End_MULTILAYER_cells/mL"])
-
-    inf_frac = (final_inf / final_total) if final_total > 0 else 0.0
-    mul_frac = (final_mul / final_total) if final_total > 0 else 0.0
-
-    return {
-        "final_stage": str(final_row["Stage"]),
-        "final_total": final_total,
-        "final_inf": final_inf,
-        "final_mul": final_mul,
-        "inf_frac": inf_frac,
-        "mul_frac": mul_frac,
-    }
-
-
-def format_sci(x: float) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    if abs(x) >= 1e6 or (abs(x) > 0 and abs(x) < 1e-2):
-        return f"{x:.3e}"
-    return f"{x:,.0f}"
-
-
 # ----------------------------
-# Streamlit UI (polished)
+# Streamlit UI
 # ----------------------------
-st.set_page_config(
-    page_title="Digital twin of Vero cell seed train",
-    page_icon="🧫",
-    layout="wide"
+st.set_page_config(page_title="Digital twin of Vero cell seed train", page_icon="🧫", layout="wide")
+st.title("🧫 Digital twin of Vero cell seed train")
+st.markdown(
+    "<span style='color: rgba(0,0,0,0.9); font-size: 0.95rem;'>"
+    "<b>Disclaimer:</b> Experimental validation is still awaiting; this application is hypothetical modelling for exploratory use only."
+    "</span>",
+    unsafe_allow_html=True
 )
-
-# Minimal CSS polish
-st.markdown("""
-<style>
-    .block-container { padding-top: 1.0rem; padding-bottom: 2.0rem; }
-    [data-testid="stSidebar"] { padding-top: 1.0rem; }
-    .hero {
-        background: white;
-        border-radius: 18px;
-        padding: 18px 18px;
-        box-shadow: 0 8px 18px rgba(0,0,0,0.06);
-        border: 1px solid rgba(0,0,0,0.06);
-    }
-    .subtle {
-        color: rgba(0,0,0,0.65);
-        font-size: 0.95rem;
-        line-height: 1.35rem;
-    }
-    div[data-testid="stMetric"] {
-        background: white;
-        padding: 14px 14px;
-        border-radius: 14px;
-        border: 1px solid rgba(0,0,0,0.06);
-        box-shadow: 0 6px 14px rgba(0,0,0,0.05);
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Hero header
-st.markdown("""
-<div class="hero">
-  <div style="display:flex; align-items:center; gap:10px;">
-    <div style="font-size:28px;">🧫</div>
-    <div style="font-size:26px; font-weight:700;">Digital twin of Vero cell seed train</div>
-  </div>
-  <div class="subtle" style="margin-top:6px;">
-    Hypothetical modelling for exploratory use only. Experimental validation is pending.
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
 st.write("")
 
-# Sidebar controls (grouped)
 with st.sidebar:
-    st.title("Control room")
-
-    mode = st.radio("View mode", ["Executive", "Process Engineer", "Scientist"], horizontal=True)
-
-    st.divider()
     st.header("Run controls")
     n_experiments = st.slider("Monte Carlo experiments (n)", 10, 10000, 1000, step=10)
     rng_seed = st.number_input("RNG seed", value=1, step=1)
 
-    st.divider()
-    with st.expander("Seed train schedule (days)", expanded=(mode != "Executive")):
-        days_bio40 = st.slider("BIO40 days", 1, 20, 5)
-        days_bio200a = st.slider("BIO200A days", 1, 20, 5)
-        days_bio750 = st.slider("BIO750 (E/F/G/H) days", 1, 20, 4)
-        days_bio1500 = st.slider("BIO1500 (A/B) days (display only)", 0, 20, 0)
+    st.subheader("Days per bioreactor")
+    days_bio40 = st.slider("BIO40 days", 1, 20, 5)
+    days_bio200a = st.slider("BIO200A days", 1, 20, 5)
+    days_bio750 = st.slider("BIO750 (E/F/G/H) days", 1, 20, 4)
 
-    with st.expander("Surface capacity (cells/MC)", expanded=(mode == "Scientist")):
-        max_cells_setpoint = st.slider("Max cells/MC setpoint", 50, 300, 140)
-        max_cells_sd = st.slider("Max cells/MC SD", 0.0, 80.0, 23.0)
+    st.subheader("Surface capacity")
+    max_cells_setpoint = st.slider("Max cells/MC setpoint", 50, 300, 140)
+    max_cells_sd = st.slider("Max cells/MC SD", 0.0, 80.0, 23.0)
 
-    with st.expander("Microcarriers & concentrations", expanded=True):
-        beads_per_mg = st.number_input("Beads per mg Cytodex (NOT per g)", value=7087.0, step=1.0)
-        beads_per_g = beads_per_mg * 1000.0
+    st.subheader("Microcarriers / particles (FIX)")
+    beads_per_mg = st.number_input("Beads per mg Cytodex (NOT per g)", value=7087.0, step=1.0)
+    beads_per_g = beads_per_mg * 1000.0
 
-        mc_bio40 = st.number_input("BIO40 MC (g/L)", value=1.2, step=0.1)
-        mc_bio200a = st.number_input("BIO200A MC (g/L)", value=4.0, step=0.1)
-        mc_bio750 = st.number_input("BIO750 MC (g/L)", value=2.6, step=0.1)
+    st.subheader("MC concentration (g/L)")
+    mc_bio40 = st.number_input("BIO40 MC (g/L)", value=1.2, step=0.1)
+    mc_bio200a = st.number_input("BIO200A MC (g/L)", value=4.0, step=0.1)
+    mc_bio750 = st.number_input("BIO750 MC (g/L)", value=2.6, step=0.1)
 
-        # quick sanity checks
-        bml40 = beads_per_ml_from_mc(float(mc_bio40), float(beads_per_g))
-        st.caption(f"BIO40 beads/mL ≈ {bml40:,.0f}")
-        st.caption(f"BIO40 max cells/mL @ {max_cells_setpoint} cells/bead ≈ {(bml40*max_cells_setpoint):,.0f}")
+    # Sanity check on beads/mL and theoretical max cells/mL
+    bml40 = beads_per_ml_from_mc(float(mc_bio40), float(beads_per_g))
+    st.caption(f"BIO40 beads/mL ≈ {bml40:,.0f}")
+    st.caption(f"BIO40 max cells/mL @ {max_cells_setpoint} cells/bead ≈ {(bml40*max_cells_setpoint):,.0f}")
 
-    with st.expander("Inoculation & variability", expanded=(mode != "Executive")):
-        inoc_bio40_cells_ml = st.number_input("BIO40 inoculation (cells/mL)", value=48000.0, step=1000.0)
-        inoc_sd_bio40 = st.number_input("BIO40 inoc SD (cells/MC)", value=2.94, step=0.1)
-        inoc_sd_bio200a = st.number_input("BIO200A inoc SD (cells/MC)", value=1.0, step=0.1)
-        inoc_sd_bio750 = st.number_input("BIO750 inoc SD (cells/MC)", value=2.2, step=0.1)
+    st.subheader("Inoculation")
+    inoc_bio40_cells_ml = st.number_input("BIO40 inoculation (cells/mL)", value=48000.0, step=1000.0)
 
-    with st.expander("Transfer / trypsin yields", expanded=(mode != "Executive")):
-        trypsin_yield_bio200a = st.slider("Trypsin yield BIO200A", 0.6, 1.0, 0.90, step=0.01)
-        trypsin_yield_bio750 = st.slider("Trypsin yield BIO750", 0.6, 1.0, 0.87, step=0.01)
-        transfer_bio1500a = st.slider("Transfer factor BIO1500A", 0.6, 1.0, 0.85, step=0.01)
-        transfer_bio1500b = st.slider("Transfer factor BIO1500B", 0.6, 1.0, 0.85, step=0.01)
+    st.subheader("Transfer / trypsin yields")
+    trypsin_yield_bio200a = st.slider("Trypsin yield BIO200A", 0.6, 1.0, 0.90, step=0.01)
+    trypsin_yield_bio750 = st.slider("Trypsin yield BIO750", 0.6, 1.0, 0.87, step=0.01)
 
-    with st.expander("Distribution factors", expanded=(mode == "Scientist")):
-        distribution_factor_EF = st.number_input("Distribution factor (E/F)", value=1.05 / 4, step=0.01)
-        distribution_factor_GH = st.number_input("Distribution factor (G/H)", value=0.95 / 4, step=0.01)
+    st.subheader("Distribution factors")
+    distribution_factor_EF = st.number_input("Distribution factor (E/F)", value=1.05 / 4, step=0.01)
+    distribution_factor_GH = st.number_input("Distribution factor (G/H)", value=0.95 / 4, step=0.01)
 
-    with st.expander("BIO200A oxygen limitation", expanded=True):
-        limit_bio200_oxygen = st.checkbox("Enable O2-limited growth in BIO200A", value=True)
-        default_start_day = min(4, int(days_bio200a))
-        bio200_limit_start_day = st.slider("Start day (BIO200A)", 0, int(days_bio200a), default_start_day)
-        bio200_spread_fraction = st.slider(
-            "Growth throttle (fraction of cells that can spread)", 0.0, 1.0, 0.15, step=0.01
-        )
-        st.caption("Interpretation: fraction of occupied cells that attempt to spread per day under limitation.")
+    st.subheader("Inoculation SD (cells/MC)")
+    inoc_sd_bio40 = st.number_input("BIO40 inoc SD (cells/MC)", value=2.94, step=0.1)
+    inoc_sd_bio200a = st.number_input("BIO200A inoc SD (cells/MC)", value=1.0, step=0.1)
+    inoc_sd_bio750 = st.number_input("BIO750 inoc SD (cells/MC)", value=2.2, step=0.1)
 
-    st.divider()
-    plot_metric = st.radio("Primary plot metric", ["TOTAL", "INFECTABLE", "MULTILAYER"], horizontal=True)
+    # BIO200A oxygen limitation defaults
+    st.subheader("BIO200A oxygen limitation")
+    limit_bio200_oxygen = st.checkbox("Enable O2-limited growth in BIO200A", value=True)
+    default_start_day = min(4, int(days_bio200a))
+    bio200_limit_start_day = st.slider("Start day (BIO200A)", 0, int(days_bio200a), default_start_day)
+    bio200_spread_fraction = st.slider(
+        "Growth throttle (fraction of cells that can spread)",
+        0.0, 1.0, 0.15, step=0.01
+    )
+
+    st.subheader("Plot metric")
+    plot_metric = st.radio("Plot metric", ["TOTAL", "INFECTABLE", "MULTILAYER"], horizontal=False)
+
     run_btn = st.button("Run simulation", type="primary", use_container_width=True)
 
-# Cache the expensive simulation
-@st.cache_data(show_spinner=False)
-def _cached_run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
-    return run_seed_train(params)
 
-# Main tabs
-tab_results, tab_sweep, tab_raw, tab_assump = st.tabs(["📈 Results", "🧪 MC Sweep", "🧾 Raw data", "ℹ️ Assumptions"])
-
-if not run_btn:
-    with tab_results:
-        st.info("Set parameters in the sidebar and click **Run simulation**.")
-else:
+if run_btn:
     params = dict(
         n_experiments=int(n_experiments),
         days_bio40=int(days_bio40),
         days_bio200a=int(days_bio200a),
         days_bio750=int(days_bio750),
-        days_bio1500=int(days_bio1500),
         max_cells_setpoint=float(max_cells_setpoint),
         max_cells_sd=float(max_cells_sd),
         beads_per_mg=float(beads_per_mg),
@@ -658,8 +525,6 @@ else:
         inoc_sd_cells_per_mc_bio750=float(inoc_sd_bio750),
         trypsin_yield_bio200a=float(trypsin_yield_bio200a),
         trypsin_yield_bio750=float(trypsin_yield_bio750),
-        transfer_bio1500a=float(transfer_bio1500a),
-        transfer_bio1500b=float(transfer_bio1500b),
         distribution_factor_EF=float(distribution_factor_EF),
         distribution_factor_GH=float(distribution_factor_GH),
         rng_seed=int(rng_seed),
@@ -668,166 +533,131 @@ else:
         bio200_spread_fraction=float(bio200_spread_fraction),
     )
 
-    with st.status("Running Monte Carlo simulation…", expanded=False) as status:
-        series, summary = _cached_run_seed_train(params)
-        status.update(label="Simulation complete", state="complete")
+    with st.spinner("Running Monte Carlo…"):
+        series, summary = run_seed_train(params)
 
-    # RESULTS TAB
-    with tab_results:
-        # KPI strip
-        kpis = kpi_block(summary)
-        c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1], gap="large")
-        with c1:
-            st.metric("Final stage", kpis["final_stage"])
-        with c2:
-            st.metric("End TOTAL (cells/mL)", format_sci(kpis["final_total"]))
-        with c3:
-            st.metric("End INFECTABLE (cells/mL)", format_sci(kpis["final_inf"]))
-        with c4:
-            st.metric("End MULTILAYER (cells/mL)", format_sci(kpis["final_mul"]))
-        with c5:
-            st.metric("Infectable fraction", f"{100*kpis['inf_frac']:.1f}%")
+    col1, col2 = st.columns([2, 1], gap="large")
 
-        # Narrative (mode-dependent)
-        if mode == "Executive":
-            st.write(
-                "This model estimates seed-train cell expansion across stages. "
-                "Key decision signals are the **infectable fraction** and the **multilayer burden**, "
-                "which may indicate diminishing returns at higher effective surface loading."
-            )
-        elif mode == "Process Engineer":
-            st.write(
-                "Use this view to stress-test assumptions across MC loading, inoculation variability, "
-                "and BIO200 oxygen limitation. Focus on stage-by-stage trends and the effect on **infectable cells/mL**."
-            )
-        else:
-            st.write(
-                "Scientist mode exposes more variability controls and assumptions. "
-                "Remember: grid capacity is a proxy for cells/bead-like surface capacity."
-            )
+    with col1:
+        st.subheader(f"All bioreactors — one plot ({plot_metric} cells/mL vs cumulative days)")
+        fig = plot_all_bioreactors_one_plot(series, metric=plot_metric)
+        st.pyplot(fig, use_container_width=True)
 
-        # Main plot + summary + download
-        left, right = st.columns([2.2, 1.0], gap="large")
-        with left:
-            fig = plot_all_bioreactors_plotly(series, metric=plot_metric)
-            st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        st.subheader("Summary")
+        st.dataframe(summary, use_container_width=True, height=420)
 
-        with right:
-            st.subheader("Summary table")
-            st.dataframe(summary, use_container_width=True, height=380)
+        zip_bytes = export_zip_csv(series, summary)
+        st.download_button(
+            "Download results (ZIP of CSVs)",
+            data=zip_bytes,
+            file_name=f"seed_train_sim_n{int(n_experiments)}.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
 
-            zip_bytes = export_zip_csv(series, summary)
-            st.download_button(
-                "Download results (ZIP of CSVs)",
-                data=zip_bytes,
-                file_name=f"seed_train_sim_n{int(n_experiments)}.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
+    # -------------------------------------------------------------------------
+    # EXTRA PLOT: BIO750E MC sweep (0..6 g/L) for TOTAL and INFECTABLE cells/mL
+    # -------------------------------------------------------------------------
+    st.subheader("BIO750E — MC sweep (0–6 g/L) impact on cells/mL")
 
-    # MC SWEEP TAB
-    with tab_sweep:
-        st.subheader("BIO750E — MC sweep (0–6 g/L)")
-        st.caption("Re-runs BIO750E growth at different MC loadings; plots TOTAL and INFECTABLE (cells/mL).")
+    inoc750E_cells_ml = None
+    try:
+        inoc750E_cells_ml = float(summary.loc[summary["Stage"] == "BIO750E", "Inoc_cells/mL"].iloc[0])
+    except Exception:
+        inoc750E_cells_ml = None
 
-        # Pull BIO750E inoculum (cells/mL) from summary table
-        try:
-            inoc750E_cells_ml = float(summary.loc[summary["Stage"] == "BIO750E", "Inoc_cells/mL"].iloc[0])
-        except Exception:
-            inoc750E_cells_ml = None
+    if inoc750E_cells_ml is None or (isinstance(inoc750E_cells_ml, float) and np.isnan(inoc750E_cells_ml)):
+        st.warning("Could not determine BIO750E inoculation from summary; MC sweep plot skipped.")
+    else:
+        mc_sweep = list(range(0, 7))  # 0,1,2,3,4,5,6 g/L
+        d750_local = int(days_bio750)
 
-        if inoc750E_cells_ml is None or (isinstance(inoc750E_cells_ml, float) and np.isnan(inoc750E_cells_ml)):
-            st.warning("Could not determine BIO750E inoculation from summary; MC sweep plot skipped.")
-        else:
-            mc_sweep = list(range(0, 7))  # 0..6 g/L
-            d750_local = int(days_bio750)
-            beads_per_g_local = float(beads_per_mg) * 1000.0
+        beads_per_g_local = float(beads_per_mg) * 1000.0
 
-            sweep_rows = []
-            for mc_val_int in mc_sweep:
-                mc_val = float(mc_val_int)
+        sweep_rows = []
+        for mc_val_int in mc_sweep:
+            mc_val = float(mc_val_int)
 
-                if mc_val <= 0.0:
-                    for day in range(d750_local + 1):
-                        sweep_rows.append({
-                            "day": float(day),
-                            "MC_g/L": mc_val,
-                            "TOTAL_cells/mL": 0.0,
-                            "INFECTABLE_cells/mL": 0.0
-                        })
-                    continue
-
-                bml = beads_per_ml_from_mc(mc_val, beads_per_g_local)
-                inoc_cells_per_mc = 0.0 if bml <= 0 else float(inoc750E_cells_ml / bml)
-
-                sim750_mc = simulate_surface_mc(
-                    n_experiments=int(n_experiments),
-                    days=d750_local,
-                    max_cells_setpoint=float(max_cells_setpoint),
-                    max_cells_sd=float(max_cells_sd),
-                    inoc_cells_per_mc_mean=float(inoc_cells_per_mc),
-                    inoc_cells_per_mc_sd=float(inoc_sd_bio750),
-                    rng_seed=int(rng_seed) + 100 + mc_val_int,
-                )
-
-                time_days, total_ml, _ = cells_ml_from_cells_per_mc(
-                    sim750_mc["TOTAL"][0], sim750_mc["TOTAL"][1],
-                    mc_val, beads_per_g_local, d750_local
-                )
-                _, inf_ml, _ = cells_ml_from_cells_per_mc(
-                    sim750_mc["INFECTABLE"][0], sim750_mc["INFECTABLE"][1],
-                    mc_val, beads_per_g_local, d750_local
-                )
-
-                for k in range(len(time_days)):
+            if mc_val <= 0.0:
+                # MC=0 means no beads -> cells/mL effectively 0 in this model
+                for day in range(d750_local + 1):
                     sweep_rows.append({
-                        "day": float(time_days[k]),
+                        "day": float(day),
                         "MC_g/L": mc_val,
-                        "TOTAL_cells/mL": float(total_ml[k]),
-                        "INFECTABLE_cells/mL": float(inf_ml[k]),
+                        "TOTAL_cells/mL": 0.0,
+                        "INFECTABLE_cells/mL": 0.0
                     })
+                continue
 
-            df_sweep = pd.DataFrame(sweep_rows)
+            bml = beads_per_ml_from_mc(mc_val, beads_per_g_local)
 
-            # Plotly lines
-            fig_total = px.line(
-                df_sweep, x="day", y="TOTAL_cells/mL", color="MC_g/L",
-                markers=True, template="simple_white",
-                title="BIO750E — TOTAL cells/mL vs days (MC sweep)"
+            # Convert inoc cells/mL -> inoc cells/bead for this MC level
+            inoc_cells_per_mc = 0.0 if bml <= 0 else float(inoc750E_cells_ml / bml)
+
+            # Re-run surface model for BIO750E at this MC level
+            sim750_mc = simulate_surface_mc(
+                n_experiments=int(n_experiments),
+                days=d750_local,
+                max_cells_setpoint=float(max_cells_setpoint),
+                max_cells_sd=float(max_cells_sd),
+                inoc_cells_per_mc_mean=float(inoc_cells_per_mc),
+                inoc_cells_per_mc_sd=float(inoc_sd_bio750),     # SD remains in cells/MC units
+                rng_seed=int(rng_seed) + 100 + mc_val_int,      # de-correlate runs
             )
-            fig_total.update_layout(height=420, legend_title="MC (g/L)")
-            st.plotly_chart(fig_total, use_container_width=True)
 
-            fig_inf = px.line(
-                df_sweep, x="day", y="INFECTABLE_cells/mL", color="MC_g/L",
-                markers=True, template="simple_white",
-                title="BIO750E — INFECTABLE cells/mL vs days (MC sweep)"
+            # Convert cells/bead trajectories -> cells/mL trajectories
+            time_days, total_ml, _ = cells_ml_from_cells_per_mc(
+                sim750_mc["TOTAL"][0], sim750_mc["TOTAL"][1],
+                mc_val, beads_per_g_local, d750_local
             )
-            fig_inf.update_layout(height=420, legend_title="MC (g/L)")
-            st.plotly_chart(fig_inf, use_container_width=True)
+            _, inf_ml, _ = cells_ml_from_cells_per_mc(
+                sim750_mc["INFECTABLE"][0], sim750_mc["INFECTABLE"][1],
+                mc_val, beads_per_g_local, d750_local
+            )
 
-            with st.expander("Show BIO750E MC sweep data table"):
-                st.dataframe(df_sweep, use_container_width=True)
+            for k in range(len(time_days)):
+                sweep_rows.append({
+                    "day": float(time_days[k]),
+                    "MC_g/L": mc_val,
+                    "TOTAL_cells/mL": float(total_ml[k]),
+                    "INFECTABLE_cells/mL": float(inf_ml[k]),
+                })
 
-    # RAW DATA TAB
-    with tab_raw:
-        st.subheader("Raw time series (per bioreactor)")
-        st.caption("Each table includes cumulative time and mean ± std (cells/mL) per metric.")
-        tabs = st.tabs(list(series.keys()))
-        for tab, (name, df) in zip(tabs, series.items()):
-            with tab:
-                st.dataframe(df, use_container_width=True, height=520)
+        df_sweep = pd.DataFrame(sweep_rows)
 
-    # ASSUMPTIONS TAB
-    with tab_assump:
-        st.subheader("Model assumptions & interpretation")
-        st.markdown("""
-- **Purpose:** exploratory, not a release / validation tool.
-- **Grid model:** each microcarrier is approximated as a 2D grid of capacity ~ `max_cells_setpoint` (with variability).
-- **States:** OCCUPIED/NEWLY_OCCUPIED/INHIBITED/MULTILAYER represent simplified surface crowding dynamics.
-- **Infectable definition:** `OCCUPIED + NEWLY_OCCUPIED + INHIBITED` (excludes MULTILAYER).
-- **BIO200 oxygen limitation:** implemented as a throttle on daily spread attempts from a user-defined start day.
-- **BIO1500 stages:** mixing only (no growth modelled); displayed as flat lines.
-        """.strip())
+        def plot_sweep_matplotlib(df_sweep: pd.DataFrame, ycol: str, title: str):
+            fig = plt.figure(figsize=(12, 6))
+            ax = fig.add_subplot(111)
 
-        st.warning("If you want, we can add confidence bands (mean ± std shading) and per-stage delta metrics (e.g., growth factor).")
+            for mc_val in sorted(df_sweep["MC_g/L"].unique()):
+                dfx = df_sweep[df_sweep["MC_g/L"] == mc_val].sort_values("day")
+                ax.plot(dfx["day"], dfx[ycol], marker="o", linewidth=2, label=f"{int(mc_val)} g/L")
+
+            ax.set_title(title)
+            ax.set_xlabel("Time (days)")
+            ax.set_ylabel("Cells / mL")
+            ax.grid(True, linestyle=":")
+            ax.legend(title="MC (g/L)", ncol=4)
+            return fig
+
+        st.pyplot(
+            plot_sweep_matplotlib(df_sweep, "TOTAL_cells/mL", "BIO750E — TOTAL cells/mL vs days (MC sweep)"),
+            use_container_width=True
+        )
+        st.pyplot(
+            plot_sweep_matplotlib(df_sweep, "INFECTABLE_cells/mL", "BIO750E — INFECTABLE cells/mL vs days (MC sweep)"),
+            use_container_width=True
+        )
+
+        with st.expander("Show BIO750E MC sweep data table"):
+            st.dataframe(df_sweep, use_container_width=True)
+
+    st.subheader("Raw time series (per bioreactor)")
+    tabs = st.tabs(list(series.keys()))
+    for tab, (name, df) in zip(tabs, series.items()):
+        with tab:
+            st.dataframe(df, use_container_width=True, height=520)
+
+else:
+    st.info("Set parameters in the sidebar and click **Run simulation**.")
