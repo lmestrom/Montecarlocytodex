@@ -3,7 +3,7 @@ import math
 import random
 import zipfile
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -20,16 +20,29 @@ INHIBITED = 3
 MULTILAYER = 4
 
 
-def update_state(grid: np.ndarray, multilayer_cycle_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def update_state(
+    grid: np.ndarray,
+    multilayer_cycle_grid: np.ndarray,
+    spread_fraction: float = 1.0,  # NEW: throttle spreading attempts (0..1)
+) -> Tuple[np.ndarray, np.ndarray]:
     """One growth step on a periodic grid."""
     grid_size = grid.shape[0]
     new_grid = np.copy(grid)
+
+    spread_fraction = float(np.clip(spread_fraction, 0.0, 1.0))
 
     for i in range(grid_size):
         for j in range(grid_size):
 
             # spreading from OCCUPIED
             if grid[i, j] == OCCUPIED:
+
+                # NEW: oxygen-limitation throttle
+                # Only a fraction of occupied cells attempt to spread this day.
+                # If they don't attempt, they remain OCCUPIED (not inhibited).
+                if random.random() > spread_fraction:
+                    continue
+
                 neighbors = [(x % grid_size, y % grid_size)
                              for x in range(i - 1, i + 2)
                              for y in range(j - 1, j + 2)
@@ -93,13 +106,17 @@ def simulate_surface_mc(
     max_cells_sd: float,
     inoc_cells_per_mc_mean: float,
     inoc_cells_per_mc_sd: float,
-    rng_seed: int = 1
+    rng_seed: int = 1,
+    spread_fraction_by_day: Optional[Callable[[int], float]] = None,  # NEW
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """
     Monte Carlo simulation on surface (cells/bead-like grid).
     Returns mean & std trajectories for:
       TOTAL, INFECTABLE, MULTILAYER
     Each trajectory is length (days+1) including day0 (initial state).
+
+    spread_fraction_by_day(day_index) -> float in [0,1]
+      day_index is 0-based (0 = first simulated day step)
     """
     random.seed(rng_seed)
     np.random.seed(rng_seed)
@@ -115,7 +132,6 @@ def simulate_surface_mc(
         inoc_cells = float(max(0.0, np.random.normal(inoc_cells_per_mc_mean, inoc_cells_per_mc_sd)))
 
         # IMPORTANT: inoculation is in cells/MC; grid has grid_size^2 sites (capacity)
-        # Cap inoc_density so initial occupied never exceeds capacity
         capacity = grid_size * grid_size
         inoc_density = min(1.0, inoc_cells / capacity)
 
@@ -136,7 +152,15 @@ def simulate_surface_mc(
         series_mul = [c0["MULTILAYER"]]
 
         for _day in range(days):
-            grid, multilayer_cycle_grid = update_state(grid, multilayer_cycle_grid)
+            sf = 1.0
+            if spread_fraction_by_day is not None:
+                sf = float(spread_fraction_by_day(_day))
+
+            grid, multilayer_cycle_grid = update_state(
+                grid,
+                multilayer_cycle_grid,
+                spread_fraction=sf
+            )
             counts = count_states(grid)
 
             series_total.append(counts["TOTAL"])
@@ -167,9 +191,7 @@ def simulate_surface_mc(
 
 
 def beads_per_ml_from_mc(mc_g_per_l: float, beads_per_g: float) -> float:
-    """
-    beads/mL = (g/L)*(beads/g)/1000
-    """
+    """beads/mL = (g/L)*(beads/g)/1000"""
     return (mc_g_per_l * beads_per_g) / 1000.0
 
 
@@ -182,8 +204,6 @@ def cells_ml_from_cells_per_mc(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     cells/mL = (beads/mL) * (cells/bead)
-    with beads/mL from mc_g_per_l & beads_per_g.
-
     mean_cells_per_mc/std_cells_per_mc must be length (days+1).
     time_h will be length (days+1) with 0,24,48,...
     """
@@ -250,16 +270,13 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
 
     # Helper: convert cells/mL inoc to cells/MC for grid seeding
     def inoc_cells_per_mc_from_cells_ml(cells_ml: float, mc_g_per_l: float) -> float:
-        # beads/mL = mc_g/L * beads/g / 1000
         bml = beads_per_ml_from_mc(mc_g_per_l, beads_per_g)
-        # cells/bead = cells/mL / beads/mL
         if bml <= 0:
             return 0.0
         return float(cells_ml / bml)
 
     # Helper: build df from simulation output (per metric)
     def build_df(name: str, days: int, mc_g_per_l: float, sim_out: dict, t_offset_h: float) -> pd.DataFrame:
-        # sim_out: metric -> (mean_cells_per_mc, std_cells_per_mc)
         records = {"time_h": None}
         time_h = None
 
@@ -312,10 +329,16 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
         end_cells_ml_multilayer=end40_mul,
     ))
 
-    # ---------------- BIO200A (transfer) ----------------
+    # ---------------- BIO200A (transfer + optional O2 limit) ----------------
     tryps200 = params["trypsin_yield_bio200a"]
     inoc200_cells_ml = tryps200 * V_BIO40 * end40_total / V_BIO200A
     inoc200_cells_per_mc = inoc_cells_per_mc_from_cells_ml(inoc200_cells_ml, MC_BIO200A)
+
+    # NEW: BIO200A oxygen limitation function (step change from selected day)
+    def bio200_spread_fn(day0_based: int) -> float:
+        if (not params["limit_bio200_oxygen"]) or (day0_based < params["bio200_limit_start_day"]):
+            return 1.0
+        return float(np.clip(params["bio200_spread_fraction"], 0.0, 1.0))
 
     sim200 = simulate_surface_mc(
         n_experiments=n,
@@ -325,6 +348,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
         inoc_cells_per_mc_mean=inoc200_cells_per_mc,
         inoc_cells_per_mc_sd=params["inoc_sd_cells_per_mc_bio200a"],
         rng_seed=params["rng_seed"] + 1,
+        spread_fraction_by_day=bio200_spread_fn,  # NEW
     )
 
     offset200 = d40 * 24.0
@@ -396,7 +420,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     inoc1500A = transferA * ((endE * V_BIO750) + (endF * V_BIO750)) / V_BIO1500
     inoc1500B = transferB * ((endG * V_BIO750) + (endH * V_BIO750)) / V_BIO1500
 
-    # keep as flat lines for display (your "Option 1" was conversion fix, not adding 1500 growth)
+    # keep as flat lines for display
     t1500 = np.array([0.0, max(0, d1500) * 24.0], dtype=float)
     offset1500 = (d40 + d200 + d750) * 24.0
 
@@ -516,6 +540,15 @@ with st.sidebar:
     inoc_sd_bio200a = st.number_input("BIO200A inoc SD (cells/MC)", value=1.0, step=0.1)
     inoc_sd_bio750 = st.number_input("BIO750 inoc SD (cells/MC)", value=2.2, step=0.1)
 
+    # NEW: oxygen limitation controls for BIO200A
+    st.subheader("BIO200A oxygen limitation")
+    limit_bio200_oxygen = st.checkbox("Enable O2-limited growth in BIO200A", value=False)
+    bio200_limit_start_day = st.slider("Start day (BIO200A)", 0, int(days_bio200a), min(3, int(days_bio200a)))
+    bio200_spread_fraction = st.slider(
+        "Growth throttle (fraction of cells that can spread)",
+        0.0, 1.0, 0.5, step=0.05
+    )
+
     rng_seed = st.number_input("RNG seed", value=1, step=1)
 
     st.subheader("Plot metric")
@@ -548,6 +581,11 @@ if run_btn:
         distribution_factor_EF=float(distribution_factor_EF),
         distribution_factor_GH=float(distribution_factor_GH),
         rng_seed=int(rng_seed),
+
+        # NEW: BIO200A oxygen limitation
+        limit_bio200_oxygen=bool(limit_bio200_oxygen),
+        bio200_limit_start_day=int(bio200_limit_start_day),
+        bio200_spread_fraction=float(bio200_spread_fraction),
     )
 
     with st.spinner("Running Monte Carlo…"):
