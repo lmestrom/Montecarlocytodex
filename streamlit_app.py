@@ -1,3 +1,5 @@
+# *Disclaimer: Experimental validation is still awaiting; this application is hypothetical modelling for exploratory use only.*
+
 import io
 import math
 import random
@@ -23,7 +25,7 @@ MULTILAYER = 4
 def update_state(
     grid: np.ndarray,
     multilayer_cycle_grid: np.ndarray,
-    spread_fraction: float = 1.0,  # NEW: throttle spreading attempts (0..1)
+    spread_fraction: float = 1.0,  # throttle spreading attempts (0..1)
 ) -> Tuple[np.ndarray, np.ndarray]:
     """One growth step on a periodic grid."""
     grid_size = grid.shape[0]
@@ -37,7 +39,7 @@ def update_state(
             # spreading from OCCUPIED
             if grid[i, j] == OCCUPIED:
 
-                # NEW: oxygen-limitation throttle
+                # oxygen-limitation throttle
                 # Only a fraction of occupied cells attempt to spread this day.
                 # If they don't attempt, they remain OCCUPIED (not inhibited).
                 if random.random() > spread_fraction:
@@ -107,7 +109,7 @@ def simulate_surface_mc(
     inoc_cells_per_mc_mean: float,
     inoc_cells_per_mc_sd: float,
     rng_seed: int = 1,
-    spread_fraction_by_day: Optional[Callable[[int], float]] = None,  # NEW
+    spread_fraction_by_day: Optional[Callable[[int], float]] = None,
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """
     Monte Carlo simulation on surface (cells/bead-like grid).
@@ -131,7 +133,7 @@ def simulate_surface_mc(
 
         inoc_cells = float(max(0.0, np.random.normal(inoc_cells_per_mc_mean, inoc_cells_per_mc_sd)))
 
-        # IMPORTANT: inoculation is in cells/MC; grid has grid_size^2 sites (capacity)
+        # inoculation is in cells/MC; grid has grid_size^2 sites (capacity)
         capacity = grid_size * grid_size
         inoc_density = min(1.0, inoc_cells / capacity)
 
@@ -205,14 +207,14 @@ def cells_ml_from_cells_per_mc(
     """
     cells/mL = (beads/mL) * (cells/bead)
     mean_cells_per_mc/std_cells_per_mc must be length (days+1).
-    time_h will be length (days+1) with 0,24,48,...
+    time_days will be length (days+1) with 0,1,2,...
     """
     bml = beads_per_ml_from_mc(mc_g_per_l, beads_per_g)
     cells_ml = bml * mean_cells_per_mc
     cells_ml_std = bml * std_cells_per_mc
 
-    time_h = np.arange(0, days + 1, dtype=float) * 24.0
-    return time_h, cells_ml, cells_ml_std
+    time_days = np.arange(0, days + 1, dtype=float)
+    return time_days, cells_ml, cells_ml_std
 
 
 def export_zip_csv(series: Dict[str, pd.DataFrame], summary: pd.DataFrame) -> bytes:
@@ -239,7 +241,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     """
     BIO40 -> BIO200A -> BIO750E/F/G/H -> BIO1500A/B (mix only)
     Returns:
-      series dict: each df has time_h, time_h_cum, TOTAL, INFECTABLE, MULTILAYER (+ std)
+      series dict: each df has time_days, time_days_cum, TOTAL, INFECTABLE, MULTILAYER (+ std)
       summary table
     """
     # Volumes (mL)
@@ -248,7 +250,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     V_BIO750 = 750000.0
     V_BIO1500 = 1500000.0
 
-    # Beads per g (FIXED OPTION 1: user gives beads/mg)
+    # Beads per g (user gives beads/mg)
     beads_per_g = params["beads_per_mg"] * 1000.0
 
     # MC (g/L)
@@ -275,24 +277,23 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
             return 0.0
         return float(cells_ml / bml)
 
-    # Helper: build df from simulation output (per metric)
-    def build_df(name: str, days: int, mc_g_per_l: float, sim_out: dict, t_offset_h: float) -> pd.DataFrame:
-        records = {"time_h": None}
-        time_h = None
+    # Helper: build df from simulation output
+    def build_df(name: str, days: int, mc_g_per_l: float, sim_out: dict, t_offset_days: float) -> pd.DataFrame:
+        time_days = None
+        df = None
 
+        cols = {}
         for metric in ("TOTAL", "INFECTABLE", "MULTILAYER"):
             mean_mc, std_mc = sim_out[metric]
-            th, mean_ml, std_ml = cells_ml_from_cells_per_mc(mean_mc, std_mc, mc_g_per_l, beads_per_g, days)
-            if time_h is None:
-                time_h = th
-            records[f"{metric}_cells_ml"] = mean_ml
-            records[f"{metric}_cells_ml_std"] = std_ml
+            td, mean_ml, std_ml = cells_ml_from_cells_per_mc(mean_mc, std_mc, mc_g_per_l, beads_per_g, days)
+            if time_days is None:
+                time_days = td
+            cols[f"{metric}_cells_ml"] = mean_ml
+            cols[f"{metric}_cells_ml_std"] = std_ml
 
-        df = pd.DataFrame({"time_h": time_h})
-        df["time_h_cum"] = df["time_h"] + float(t_offset_h)
-        for k, v in records.items():
-            if k == "time_h":
-                continue
+        df = pd.DataFrame({"time_days": time_days})
+        df["time_days_cum"] = df["time_days"] + float(t_offset_days)
+        for k, v in cols.items():
             df[k] = v
         df["stage"] = name
         return df
@@ -314,7 +315,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
         rng_seed=params["rng_seed"],
     )
 
-    df40 = build_df("BIO40", d40, MC_BIO40, sim40, t_offset_h=0.0)
+    df40 = build_df("BIO40", d40, MC_BIO40, sim40, t_offset_days=0.0)
     results["BIO40"] = df40
 
     end40_total = float(df40["TOTAL_cells_ml"].iloc[-1])
@@ -329,12 +330,11 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
         end_cells_ml_multilayer=end40_mul,
     ))
 
-    # ---------------- BIO200A (transfer + optional O2 limit) ----------------
+    # ---------------- BIO200A (transfer + O2 limit) ----------------
     tryps200 = params["trypsin_yield_bio200a"]
     inoc200_cells_ml = tryps200 * V_BIO40 * end40_total / V_BIO200A
     inoc200_cells_per_mc = inoc_cells_per_mc_from_cells_ml(inoc200_cells_ml, MC_BIO200A)
 
-    # NEW: BIO200A oxygen limitation function (step change from selected day)
     def bio200_spread_fn(day0_based: int) -> float:
         if (not params["limit_bio200_oxygen"]) or (day0_based < params["bio200_limit_start_day"]):
             return 1.0
@@ -348,11 +348,11 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
         inoc_cells_per_mc_mean=inoc200_cells_per_mc,
         inoc_cells_per_mc_sd=params["inoc_sd_cells_per_mc_bio200a"],
         rng_seed=params["rng_seed"] + 1,
-        spread_fraction_by_day=bio200_spread_fn,  # NEW
+        spread_fraction_by_day=bio200_spread_fn,
     )
 
-    offset200 = d40 * 24.0
-    df200 = build_df("BIO200A", d200, MC_BIO200A, sim200, t_offset_h=offset200)
+    offset200 = float(d40)
+    df200 = build_df("BIO200A", d200, MC_BIO200A, sim200, t_offset_days=offset200)
     results["BIO200A"] = df200
 
     end200_total = float(df200["TOTAL_cells_ml"].iloc[-1])
@@ -372,7 +372,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     dist_EF = params["distribution_factor_EF"]
     dist_GH = params["distribution_factor_GH"]
 
-    offset750 = (d40 + d200) * 24.0
+    offset750 = float(d40 + d200)
 
     def run_750(tag: str, dist_factor: float, seed_add: int) -> pd.DataFrame:
         inoc750_cells_ml = dist_factor * tryps750 * V_BIO200A * end200_total / V_BIO750
@@ -388,7 +388,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
             rng_seed=params["rng_seed"] + seed_add,
         )
 
-        df750 = build_df(f"BIO750{tag}", d750, MC_BIO750, sim750, t_offset_h=offset750)
+        df750 = build_df(f"BIO750{tag}", d750, MC_BIO750, sim750, t_offset_days=offset750)
 
         end_total = float(df750["TOTAL_cells_ml"].iloc[-1])
         end_inf = float(df750["INFECTABLE_cells_ml"].iloc[-1])
@@ -420,13 +420,13 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
     inoc1500A = transferA * ((endE * V_BIO750) + (endF * V_BIO750)) / V_BIO1500
     inoc1500B = transferB * ((endG * V_BIO750) + (endH * V_BIO750)) / V_BIO1500
 
-    # keep as flat lines for display
-    t1500 = np.array([0.0, max(0, d1500) * 24.0], dtype=float)
-    offset1500 = (d40 + d200 + d750) * 24.0
+    # flat lines for display
+    t1500 = np.array([0.0, float(max(0, d1500))], dtype=float)
+    offset1500 = float(d40 + d200 + d750)
 
     def mix_df(name: str, inoc_ml: float) -> pd.DataFrame:
-        df = pd.DataFrame({"time_h": t1500})
-        df["time_h_cum"] = df["time_h"] + offset1500
+        df = pd.DataFrame({"time_days": t1500})
+        df["time_days_cum"] = df["time_days"] + offset1500
         df["TOTAL_cells_ml"] = [inoc_ml, inoc_ml]
         df["INFECTABLE_cells_ml"] = [inoc_ml, inoc_ml]
         df["MULTILAYER_cells_ml"] = [0.0, 0.0]
@@ -470,7 +470,7 @@ def run_seed_train(params: dict) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]
 def plot_all_bioreactors_one_plot(series: Dict[str, pd.DataFrame], metric: str):
     """
     metric in {"TOTAL", "INFECTABLE", "MULTILAYER"}
-    plots <metric>_cells_ml vs time_h_cum
+    plots <metric>_cells_ml vs time_days_cum
     """
     fig = plt.figure(figsize=(12, 7))
     ax = fig.add_subplot(111)
@@ -478,10 +478,10 @@ def plot_all_bioreactors_one_plot(series: Dict[str, pd.DataFrame], metric: str):
     col = f"{metric}_cells_ml"
 
     for name, df in series.items():
-        ax.plot(df["time_h_cum"], df[col], marker="o", label=name)
+        ax.plot(df["time_days_cum"], df[col], marker="o", label=name)
 
-    ax.set_title(f"All bioreactors — {metric} cells/mL vs cumulative time")
-    ax.set_xlabel("Time (h) — cumulative")
+    ax.set_title(f"All bioreactors — {metric} cells/mL vs cumulative days")
+    ax.set_xlabel("Time (days) — cumulative")
     ax.set_ylabel("Cells / mL")
     ax.grid(True, which="both", linestyle=":")
     ax.legend()
@@ -491,17 +491,17 @@ def plot_all_bioreactors_one_plot(series: Dict[str, pd.DataFrame], metric: str):
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.set_page_config(page_title="Seed Train Monte Carlo (Cytodex)", layout="wide")
-st.title("Seed Train Monte Carlo (Cytodex surface model) — FIXED beads unit (7087 per mg)")
+st.set_page_config(page_title="Digital twin of Vero cell seed train", layout="wide")
+st.title("Digital twin of Vero cell seed train")
 
 with st.sidebar:
     st.header("Run controls")
-    n_experiments = st.slider("Monte Carlo experiments (n)", 10, 5000, 100, step=10)
+    n_experiments = st.slider("Monte Carlo experiments (n)", 10, 10000, 1000, step=10)
 
     st.subheader("Days per bioreactor")
-    days_bio40 = st.slider("BIO40 days", 1, 20, 6)
-    days_bio200a = st.slider("BIO200A days", 1, 20, 6)
-    days_bio750 = st.slider("BIO750 (E/F/G/H) days", 1, 20, 6)
+    days_bio40 = st.slider("BIO40 days", 1, 20, 5)
+    days_bio200a = st.slider("BIO200A days", 1, 20, 5)
+    days_bio750 = st.slider("BIO750 (E/F/G/H) days", 1, 20, 4)
     days_bio1500 = st.slider("BIO1500 (A/B) days (display only)", 0, 20, 0)
 
     st.subheader("Surface capacity")
@@ -540,13 +540,13 @@ with st.sidebar:
     inoc_sd_bio200a = st.number_input("BIO200A inoc SD (cells/MC)", value=1.0, step=0.1)
     inoc_sd_bio750 = st.number_input("BIO750 inoc SD (cells/MC)", value=2.2, step=0.1)
 
-    # NEW: oxygen limitation controls for BIO200A
+    # BIO200A oxygen limitation defaults
     st.subheader("BIO200A oxygen limitation")
-    limit_bio200_oxygen = st.checkbox("Enable O2-limited growth in BIO200A", value=False)
-    bio200_limit_start_day = st.slider("Start day (BIO200A)", 0, int(days_bio200a), min(3, int(days_bio200a)))
+    limit_bio200_oxygen = st.checkbox("Enable O2-limited growth in BIO200A", value=True)
+    bio200_limit_start_day = st.slider("Start day (BIO200A)", 0, int(days_bio200a), 4)
     bio200_spread_fraction = st.slider(
         "Growth throttle (fraction of cells that can spread)",
-        0.0, 1.0, 0.5, step=0.05
+        0.0, 1.0, 0.15, step=0.01
     )
 
     rng_seed = st.number_input("RNG seed", value=1, step=1)
@@ -582,7 +582,6 @@ if run_btn:
         distribution_factor_GH=float(distribution_factor_GH),
         rng_seed=int(rng_seed),
 
-        # NEW: BIO200A oxygen limitation
         limit_bio200_oxygen=bool(limit_bio200_oxygen),
         bio200_limit_start_day=int(bio200_limit_start_day),
         bio200_spread_fraction=float(bio200_spread_fraction),
@@ -594,7 +593,7 @@ if run_btn:
     col1, col2 = st.columns([2, 1], gap="large")
 
     with col1:
-        st.subheader(f"All bioreactors — one plot ({plot_metric} cells/mL vs cumulative time)")
+        st.subheader(f"All bioreactors — one plot ({plot_metric} cells/mL vs cumulative days)")
         fig = plot_all_bioreactors_one_plot(series, metric=plot_metric)
         st.pyplot(fig, use_container_width=True)
 
